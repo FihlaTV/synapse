@@ -12,15 +12,17 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import synapse.util.async
 
-from ._base import SQLBaseStore
-from . import engines
+import logging
+from typing import Optional
+
+from canonicaljson import json
 
 from twisted.internet import defer
 
-import ujson as json
-import logging
+from synapse.metrics.background_process_metrics import run_as_background_process
+
+from . import engines
 
 logger = logging.getLogger(__name__)
 
@@ -50,7 +52,9 @@ class BackgroundUpdatePerformance(object):
         Returns:
             A duration in ms as a float
         """
-        if self.total_item_count == 0:
+        if self.avg_duration_ms == 0:
+            return 0
+        elif self.total_item_count == 0:
             return None
         else:
             # Use the exponential moving average so that we can adapt to
@@ -62,13 +66,15 @@ class BackgroundUpdatePerformance(object):
         Returns:
             A duration in ms as a float
         """
-        if self.total_item_count == 0:
+        if self.total_duration_ms == 0:
+            return 0
+        elif self.total_item_count == 0:
             return None
         else:
             return float(self.total_item_count) / float(self.total_duration_ms)
 
 
-class BackgroundUpdateStore(SQLBaseStore):
+class BackgroundUpdater(object):
     """ Background updates are updates to the database that run in the
     background. Each update processes a batch of data at once. We attempt to
     limit the impact of each update by monitoring how long each batch takes to
@@ -80,25 +86,29 @@ class BackgroundUpdateStore(SQLBaseStore):
     BACKGROUND_UPDATE_INTERVAL_MS = 1000
     BACKGROUND_UPDATE_DURATION_MS = 100
 
-    def __init__(self, hs):
-        super(BackgroundUpdateStore, self).__init__(hs)
+    def __init__(self, hs, database):
+        self._clock = hs.get_clock()
+        self.db = database
+
         self._background_update_performance = {}
         self._background_update_queue = []
         self._background_update_handlers = {}
+        self._all_done = False
 
-    @defer.inlineCallbacks
     def start_doing_background_updates(self):
-        logger.info("Starting background schema updates")
+        run_as_background_process("background_updates", self.run_background_updates)
 
+    async def run_background_updates(self, sleep=True):
+        logger.info("Starting background schema updates")
         while True:
-            yield synapse.util.async.sleep(
-                self.BACKGROUND_UPDATE_INTERVAL_MS / 1000.)
+            if sleep:
+                await self._clock.sleep(self.BACKGROUND_UPDATE_INTERVAL_MS / 1000.0)
 
             try:
-                result = yield self.do_next_background_update(
+                result = await self.do_next_background_update(
                     self.BACKGROUND_UPDATE_DURATION_MS
                 )
-            except:
+            except Exception:
                 logger.exception("Error doing update")
             else:
                 if result is None:
@@ -106,46 +116,99 @@ class BackgroundUpdateStore(SQLBaseStore):
                         "No more background updates to do."
                         " Unscheduling background update task."
                     )
-                    defer.returnValue(None)
+                    self._all_done = True
+                    return None
 
     @defer.inlineCallbacks
-    def do_next_background_update(self, desired_duration_ms):
+    def has_completed_background_updates(self):
+        """Check if all the background updates have completed
+
+        Returns:
+            Deferred[bool]: True if all background updates have completed
+        """
+        # if we've previously determined that there is nothing left to do, that
+        # is easy
+        if self._all_done:
+            return True
+
+        # obviously, if we have things in our queue, we're not done.
+        if self._background_update_queue:
+            return False
+
+        # otherwise, check if there are updates to be run. This is important,
+        # as we may be running on a worker which doesn't perform the bg updates
+        # itself, but still wants to wait for them to happen.
+        updates = yield self.db.simple_select_onecol(
+            "background_updates",
+            keyvalues=None,
+            retcol="1",
+            desc="has_completed_background_updates",
+        )
+        if not updates:
+            self._all_done = True
+            return True
+
+        return False
+
+    async def has_completed_background_update(self, update_name) -> bool:
+        """Check if the given background update has finished running.
+        """
+
+        if self._all_done:
+            return True
+
+        if update_name in self._background_update_queue:
+            return False
+
+        update_exists = await self.db.simple_select_one_onecol(
+            "background_updates",
+            keyvalues={"update_name": update_name},
+            retcol="1",
+            desc="has_completed_background_update",
+            allow_none=True,
+        )
+
+        return not update_exists
+
+    async def do_next_background_update(
+        self, desired_duration_ms: float
+    ) -> Optional[int]:
         """Does some amount of work on the next queued background update
+
+        Returns once some amount of work is done.
 
         Args:
             desired_duration_ms(float): How long we want to spend
                 updating.
         Returns:
-            A deferred that completes once some amount of work is done.
-            The deferred will have a value of None if there is currently
-            no more work to do.
+            None if there is no more work to do, otherwise an int
         """
         if not self._background_update_queue:
-            updates = yield self._simple_select_list(
+            updates = await self.db.simple_select_list(
                 "background_updates",
                 keyvalues=None,
                 retcols=("update_name", "depends_on"),
             )
-            in_flight = set(update["update_name"] for update in updates)
+            in_flight = {update["update_name"] for update in updates}
             for update in updates:
                 if update["depends_on"] not in in_flight:
-                    self._background_update_queue.append(update['update_name'])
+                    self._background_update_queue.append(update["update_name"])
 
         if not self._background_update_queue:
             # no work left to do
-            defer.returnValue(None)
+            return None
 
         # pop from the front, and add back to the back
         update_name = self._background_update_queue.pop(0)
         self._background_update_queue.append(update_name)
 
-        res = yield self._do_background_update(update_name, desired_duration_ms)
-        defer.returnValue(res)
+        res = await self._do_background_update(update_name, desired_duration_ms)
+        return res
 
-    @defer.inlineCallbacks
-    def _do_background_update(self, update_name, desired_duration_ms):
-        logger.info("Starting update batch on background update '%s'",
-                    update_name)
+    async def _do_background_update(
+        self, update_name: str, desired_duration_ms: float
+    ) -> int:
+        logger.info("Starting update batch on background update '%s'", update_name)
 
         update_handler = self._background_update_handlers[update_name]
 
@@ -164,24 +227,26 @@ class BackgroundUpdateStore(SQLBaseStore):
         else:
             batch_size = self.DEFAULT_BACKGROUND_BATCH_SIZE
 
-        progress_json = yield self._simple_select_one_onecol(
+        progress_json = await self.db.simple_select_one_onecol(
             "background_updates",
             keyvalues={"update_name": update_name},
-            retcol="progress_json"
+            retcol="progress_json",
         )
 
         progress = json.loads(progress_json)
 
         time_start = self._clock.time_msec()
-        items_updated = yield update_handler(progress, batch_size)
+        items_updated = await update_handler(progress, batch_size)
         time_stop = self._clock.time_msec()
 
         duration_ms = time_stop - time_start
 
         logger.info(
-            "Updating %r. Updated %r items in %rms."
+            "Running background update %r. Processed %r items in %rms."
             " (total_rate=%r/ms, current_rate=%r/ms, total_updated=%r, batch_size=%r)",
-            update_name, items_updated, duration_ms,
+            update_name,
+            items_updated,
+            duration_ms,
             performance.total_items_per_ms(),
             performance.average_items_per_ms(),
             performance.total_item_count,
@@ -190,7 +255,7 @@ class BackgroundUpdateStore(SQLBaseStore):
 
         performance.update(items_updated, duration_ms)
 
-        defer.returnValue(len(self._background_update_performance))
+        return len(self._background_update_performance)
 
     def register_background_update_handler(self, update_name, update_handler):
         """Register a handler for doing a background update.
@@ -200,8 +265,10 @@ class BackgroundUpdateStore(SQLBaseStore):
         * A dict of the current progress
         * An integer count of the number of items to update in this batch.
 
-        The handler should return a deferred integer count of items updated.
-        The hander is responsible for updating the progress of the update.
+        The handler should return a deferred or coroutine which returns an integer count
+        of items updated.
+
+        The handler is responsible for updating the progress of the update.
 
         Args:
             update_name(str): The name of the update that this code handles.
@@ -209,10 +276,36 @@ class BackgroundUpdateStore(SQLBaseStore):
         """
         self._background_update_handlers[update_name] = update_handler
 
-    def register_background_index_update(self, update_name, index_name,
-                                         table, columns, where_clause=None,
-                                         unique=False,
-                                         psql_only=False):
+    def register_noop_background_update(self, update_name):
+        """Register a noop handler for a background update.
+
+        This is useful when we previously did a background update, but no
+        longer wish to do the update. In this case the background update should
+        be removed from the schema delta files, but there may still be some
+        users who have the background update queued, so this method should
+        also be called to clear the update.
+
+        Args:
+            update_name (str): Name of update
+        """
+
+        @defer.inlineCallbacks
+        def noop_update(progress, batch_size):
+            yield self._end_background_update(update_name)
+            return 1
+
+        self.register_background_update_handler(update_name, noop_update)
+
+    def register_background_index_update(
+        self,
+        update_name,
+        index_name,
+        table,
+        columns,
+        where_clause=None,
+        unique=False,
+        psql_only=False,
+    ):
         """Helper for store classes to do a background index addition
 
         To use:
@@ -258,7 +351,7 @@ class BackgroundUpdateStore(SQLBaseStore):
                     "name": index_name,
                     "table": table,
                     "columns": ", ".join(columns),
-                    "where_clause": "WHERE " + where_clause if where_clause else ""
+                    "where_clause": "WHERE " + where_clause if where_clause else "",
                 }
                 logger.debug("[SQL] %s", sql)
                 c.execute(sql)
@@ -269,7 +362,7 @@ class BackgroundUpdateStore(SQLBaseStore):
             # Sqlite doesn't support concurrent creation of indexes.
             #
             # We don't use partial indices on SQLite as it wasn't introduced
-            # until 3.8, and wheezy has 3.7
+            # until 3.8, and wheezy and CentOS 7 have 3.7
             #
             # We assume that sqlite doesn't give us invalid indices; however
             # we may still end up with the index existing but the
@@ -290,7 +383,7 @@ class BackgroundUpdateStore(SQLBaseStore):
             logger.debug("[SQL] %s", sql)
             c.execute(sql)
 
-        if isinstance(self.database_engine, engines.PostgresEngine):
+        if isinstance(self.db.engine, engines.PostgresEngine):
             runner = create_index_psql
         elif psql_only:
             runner = None
@@ -301,9 +394,9 @@ class BackgroundUpdateStore(SQLBaseStore):
         def updater(progress, batch_size):
             if runner is not None:
                 logger.info("Adding index %s to %s", index_name, table)
-                yield self.runWithConnection(runner)
+                yield self.db.runWithConnection(runner)
             yield self._end_background_update(update_name)
-            defer.returnValue(1)
+            return 1
 
         self.register_background_update_handler(update_name, updater)
 
@@ -323,9 +416,9 @@ class BackgroundUpdateStore(SQLBaseStore):
         self._background_update_queue = []
         progress_json = json.dumps(progress)
 
-        return self._simple_insert(
+        return self.db.simple_insert(
             "background_updates",
-            {"update_name": update_name, "progress_json": progress_json}
+            {"update_name": update_name, "progress_json": progress_json},
         )
 
     def _end_background_update(self, update_name):
@@ -339,8 +432,23 @@ class BackgroundUpdateStore(SQLBaseStore):
         self._background_update_queue = [
             name for name in self._background_update_queue if name != update_name
         ]
-        return self._simple_delete_one(
+        return self.db.simple_delete_one(
             "background_updates", keyvalues={"update_name": update_name}
+        )
+
+    def _background_update_progress(self, update_name: str, progress: dict):
+        """Update the progress of a background update
+
+        Args:
+            update_name: The name of the background update task
+            progress: The progress of the update.
+        """
+
+        return self.db.runInteraction(
+            "background_update_progress",
+            self._background_update_progress_txn,
+            update_name,
+            progress,
         )
 
     def _background_update_progress_txn(self, txn, update_name, progress):
@@ -354,7 +462,7 @@ class BackgroundUpdateStore(SQLBaseStore):
 
         progress_json = json.dumps(progress)
 
-        self._simple_update_one_txn(
+        self.db.simple_update_one_txn(
             txn,
             "background_updates",
             keyvalues={"update_name": update_name},

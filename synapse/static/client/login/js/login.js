@@ -1,36 +1,41 @@
 window.matrixLogin = {
-    endpoint: location.origin + "/_matrix/client/api/v1/login",
+    endpoint: location.origin + "/_matrix/client/r0/login",
     serverAcceptsPassword: false,
-    serverAcceptsCas: false
+    serverAcceptsSso: false,
 };
+
+var title_pre_auth = "Log in with one of the following methods";
+var title_post_auth = "Logging in...";
 
 var submitPassword = function(user, pwd) {
     console.log("Logging in with password...");
+    set_title(title_post_auth);
     var data = {
         type: "m.login.password",
         user: user,
         password: pwd,
     };
     $.post(matrixLogin.endpoint, JSON.stringify(data), function(response) {
-        show_login();
         matrixLogin.onLogin(response);
     }).error(errorFunc);
 };
 
 var submitToken = function(loginToken) {
     console.log("Logging in with login token...");
+    set_title(title_post_auth);
     var data = {
         type: "m.login.token",
         token: loginToken
     };
     $.post(matrixLogin.endpoint, JSON.stringify(data), function(response) {
-        show_login();
         matrixLogin.onLogin(response);
     }).error(errorFunc);
 };
 
 var errorFunc = function(err) {
-    show_login();
+    // We want to show the error to the user rather than redirecting immediately to the
+    // SSO portal (if SSO is the only login option), so we inhibit the redirect.
+    show_login(true);
 
     if (err.responseJSON && err.responseJSON.error) {
         setFeedbackString(err.responseJSON.error + " (" + err.responseJSON.errcode + ")");
@@ -40,51 +45,59 @@ var errorFunc = function(err) {
     }
 };
 
-var gotoCas = function() {
-    var this_page = window.location.origin + window.location.pathname;
-    var redirect_url = matrixLogin.endpoint + "/cas/redirect?redirectUrl=" + encodeURIComponent(this_page);
-    window.location.replace(redirect_url);
-}
-
 var setFeedbackString = function(text) {
     $("#feedback").text(text);
 };
 
-var show_login = function() {
-    $("#loading").hide();
+var show_login = function(inhibit_redirect) {
+    var this_page = window.location.origin + window.location.pathname;
+    $("#sso_redirect_url").val(this_page);
+
+    // If inhibit_redirect is false, and SSO is the only supported login method, we can
+    // redirect straight to the SSO page
+    if (matrixLogin.serverAcceptsSso) {
+        if (!inhibit_redirect && !matrixLogin.serverAcceptsPassword) {
+            $("#sso_form").submit();
+            return;
+        }
+
+        // Otherwise, show the SSO form
+        $("#sso_form").show();
+    }
 
     if (matrixLogin.serverAcceptsPassword) {
-        $("#password_form").show();
+        $("#password_flow").show();
     }
 
-    if (matrixLogin.serverAcceptsCas) {
-        $("#cas_flow").show();
-    }
-
-    if (!matrixLogin.serverAcceptsPassword && !matrixLogin.serverAcceptsCas) {
+    if (!matrixLogin.serverAcceptsPassword && !matrixLogin.serverAcceptsSso) {
         $("#no_login_types").show();
     }
+
+    set_title(title_pre_auth);
+
+    $("#loading").hide();
 };
 
 var show_spinner = function() {
-    $("#password_form").hide();
-    $("#cas_flow").hide();
+    $("#password_flow").hide();
+    $("#sso_flow").hide();
     $("#no_login_types").hide();
     $("#loading").show();
 };
 
+var set_title = function(title) {
+    $("#title").text(title);
+};
 
 var fetch_info = function(cb) {
     $.get(matrixLogin.endpoint, function(response) {
         var serverAcceptsPassword = false;
-        var serverAcceptsCas = false;
         for (var i=0; i<response.flows.length; i++) {
             var flow = response.flows[i];
-            if ("m.login.cas" === flow.type) {
-                matrixLogin.serverAcceptsCas = true;
-                console.log("Server accepts CAS");
+            if ("m.login.sso" === flow.type) {
+                matrixLogin.serverAcceptsSso = true;
+                console.log("Server accepts SSO");
             }
-
             if ("m.login.password" === flow.type) {
                 matrixLogin.serverAcceptsPassword = true;
                 console.log("Server accepts password");
@@ -98,7 +111,7 @@ var fetch_info = function(cb) {
 matrixLogin.onLoad = function() {
     fetch_info(function() {
         if (!try_token()) {
-            show_login();
+            show_login(false);
         }
     });
 };

@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 # Copyright 2014-2016 OpenMarket Ltd
+# Copyright 2019 New Vector Ltd
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -14,60 +15,66 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import synapse
+from __future__ import print_function
 
 import gc
 import logging
+import math
 import os
+import resource
 import sys
 
-import synapse.config.logger
-from synapse.config._base import ConfigError
+from six import iteritems
 
-from synapse.python_dependencies import (
-    check_requirements, CONDITIONAL_REQUIREMENTS
-)
+from prometheus_client import Gauge
 
-from synapse.rest import ClientRestResource
-from synapse.storage.engines import create_engine, IncorrectDatabaseSetup
-from synapse.storage import are_all_users_on_domain
-from synapse.storage.prepare_database import UpgradeDatabaseException, prepare_database
-
-from synapse.server import HomeServer
-
-from twisted.internet import reactor, defer
 from twisted.application import service
-from twisted.web.resource import Resource, EncodingResourceWrapper
-from twisted.web.static import File
+from twisted.internet import defer, reactor
+from twisted.python.failure import Failure
+from twisted.web.resource import EncodingResourceWrapper, IResource, NoResource
 from twisted.web.server import GzipEncoderFactory
-from synapse.http.server import RootRedirect
-from synapse.rest.media.v0.content_repository import ContentRepoResource
-from synapse.rest.media.v1.media_repository import MediaRepositoryResource
-from synapse.rest.key.v1.server_key_resource import LocalKey
-from synapse.rest.key.v2 import KeyApiV2Resource
-from synapse.api.urls import (
-    FEDERATION_PREFIX, WEB_CLIENT_PREFIX, CONTENT_REPO_PREFIX,
-    SERVER_KEY_PREFIX, LEGACY_MEDIA_PREFIX, MEDIA_PREFIX, STATIC_PREFIX,
-    SERVER_KEY_V2_PREFIX,
-)
-from synapse.config.homeserver import HomeServerConfig
-from synapse.crypto import context_factory
-from synapse.util.logcontext import LoggingContext, PreserveLoggingContext
-from synapse.metrics import register_memory_metrics
-from synapse.metrics.resource import MetricsResource, METRICS_PREFIX
-from synapse.replication.tcp.resource import ReplicationStreamProtocolFactory
-from synapse.federation.transport.server import TransportLayerServer
+from twisted.web.static import File
 
-from synapse.util.rlimit import change_resource_limit
-from synapse.util.versionstring import get_version_string
+import synapse
+import synapse.config.logger
+from synapse import events
+from synapse.api.urls import (
+    FEDERATION_PREFIX,
+    LEGACY_MEDIA_PREFIX,
+    MEDIA_PREFIX,
+    SERVER_KEY_V2_PREFIX,
+    STATIC_PREFIX,
+    WEB_CLIENT_PREFIX,
+)
+from synapse.app import _base
+from synapse.app._base import listen_ssl, listen_tcp, quit_with_error
+from synapse.config._base import ConfigError
+from synapse.config.homeserver import HomeServerConfig
+from synapse.federation.transport.server import TransportLayerServer
+from synapse.http.additional_resource import AdditionalResource
+from synapse.http.server import RootRedirect
+from synapse.http.site import SynapseSite
+from synapse.logging.context import LoggingContext
+from synapse.metrics import METRICS_PREFIX, MetricsResource, RegistryProxy
+from synapse.metrics.background_process_metrics import run_as_background_process
+from synapse.module_api import ModuleApi
+from synapse.python_dependencies import check_requirements
+from synapse.replication.http import REPLICATION_PREFIX, ReplicationRestResource
+from synapse.replication.tcp.resource import ReplicationStreamProtocolFactory
+from synapse.rest import ClientRestResource
+from synapse.rest.admin import AdminRestResource
+from synapse.rest.key.v2 import KeyApiV2Resource
+from synapse.rest.well_known import WellKnownResource
+from synapse.server import HomeServer
+from synapse.storage import DataStore
+from synapse.storage.engines import IncorrectDatabaseSetup
+from synapse.storage.prepare_database import UpgradeDatabaseException
+from synapse.util.caches import CACHE_SIZE_FACTOR
 from synapse.util.httpresourcetree import create_resource_tree
 from synapse.util.manhole import manhole
-
-from synapse.http.site import SynapseSite
-
-from synapse import events
-
-from daemonize import Daemonize
+from synapse.util.module_loader import load_module
+from synapse.util.rlimit import change_resource_limit
+from synapse.util.versionstring import get_version_string
 
 logger = logging.getLogger("synapse.app.homeserver")
 
@@ -76,200 +83,231 @@ def gz_wrap(r):
     return EncodingResourceWrapper(r, [GzipEncoderFactory()])
 
 
-def build_resource_for_web_client(hs):
-    webclient_path = hs.get_config().web_client_location
-    if not webclient_path:
-        try:
-            import syweb
-        except ImportError:
-            quit_with_error(
-                "Could not find a webclient.\n\n"
-                "Please either install the matrix-angular-sdk or configure\n"
-                "the location of the source to serve via the configuration\n"
-                "option `web_client_location`\n\n"
-                "To install the `matrix-angular-sdk` via pip, run:\n\n"
-                "    pip install '%(dep)s'\n"
-                "\n"
-                "You can also disable hosting of the webclient via the\n"
-                "configuration option `web_client`\n"
-                % {"dep": CONDITIONAL_REQUIREMENTS["web_client"].keys()[0]}
-            )
-        syweb_path = os.path.dirname(syweb.__file__)
-        webclient_path = os.path.join(syweb_path, "webclient")
-    # GZip is disabled here due to
-    # https://twistedmatrix.com/trac/ticket/7678
-    # (It can stay enabled for the API resources: they call
-    # write() with the whole body and then finish() straight
-    # after and so do not trigger the bug.
-    # GzipFile was removed in commit 184ba09
-    # return GzipFile(webclient_path)  # TODO configurable?
-    return File(webclient_path)  # TODO configurable?
-
-
 class SynapseHomeServer(HomeServer):
+    DATASTORE_CLASS = DataStore
+
     def _listener_http(self, config, listener_config):
         port = listener_config["port"]
         bind_addresses = listener_config["bind_addresses"]
         tls = listener_config.get("tls", False)
         site_tag = listener_config.get("tag", port)
 
-        if tls and config.no_tls:
-            return
-
         resources = {}
         for res in listener_config["resources"]:
             for name in res["names"]:
-                if name == "client":
-                    client_resource = ClientRestResource(self)
-                    if res["compress"]:
-                        client_resource = gz_wrap(client_resource)
+                if name == "openid" and "federation" in res["names"]:
+                    # Skip loading openid resource if federation is defined
+                    # since federation resource will include openid
+                    continue
+                resources.update(
+                    self._configure_named_resource(name, res.get("compress", False))
+                )
 
-                    resources.update({
-                        "/_matrix/client/api/v1": client_resource,
-                        "/_matrix/client/r0": client_resource,
-                        "/_matrix/client/unstable": client_resource,
-                        "/_matrix/client/v2_alpha": client_resource,
-                        "/_matrix/client/versions": client_resource,
-                    })
+        additional_resources = listener_config.get("additional_resources", {})
+        logger.debug("Configuring additional resources: %r", additional_resources)
+        module_api = ModuleApi(self, self.get_auth_handler())
+        for path, resmodule in additional_resources.items():
+            handler_cls, config = load_module(resmodule)
+            handler = handler_cls(config, module_api)
+            if IResource.providedBy(handler):
+                resource = handler
+            elif hasattr(handler, "handle_request"):
+                resource = AdditionalResource(self, handler.handle_request)
+            else:
+                raise ConfigError(
+                    "additional_resource %s does not implement a known interface"
+                    % (resmodule["module"],)
+                )
+            resources[path] = resource
 
-                if name == "federation":
-                    resources.update({
-                        FEDERATION_PREFIX: TransportLayerServer(self),
-                    })
-
-                if name in ["static", "client"]:
-                    resources.update({
-                        STATIC_PREFIX: File(
-                            os.path.join(os.path.dirname(synapse.__file__), "static")
-                        ),
-                    })
-
-                if name in ["media", "federation", "client"]:
-                    media_repo = MediaRepositoryResource(self)
-                    resources.update({
-                        MEDIA_PREFIX: media_repo,
-                        LEGACY_MEDIA_PREFIX: media_repo,
-                        CONTENT_REPO_PREFIX: ContentRepoResource(
-                            self, self.config.uploads_path
-                        ),
-                    })
-
-                if name in ["keys", "federation"]:
-                    resources.update({
-                        SERVER_KEY_PREFIX: LocalKey(self),
-                        SERVER_KEY_V2_PREFIX: KeyApiV2Resource(self),
-                    })
-
-                if name == "webclient":
-                    resources[WEB_CLIENT_PREFIX] = build_resource_for_web_client(self)
-
-                if name == "metrics" and self.get_config().enable_metrics:
-                    resources[METRICS_PREFIX] = MetricsResource(self)
-
+        # try to find something useful to redirect '/' to
         if WEB_CLIENT_PREFIX in resources:
             root_resource = RootRedirect(WEB_CLIENT_PREFIX)
+        elif STATIC_PREFIX in resources:
+            root_resource = RootRedirect(STATIC_PREFIX)
         else:
-            root_resource = Resource()
+            root_resource = NoResource()
 
         root_resource = create_resource_tree(resources, root_resource)
 
         if tls:
-            for address in bind_addresses:
-                reactor.listenSSL(
-                    port,
-                    SynapseSite(
-                        "synapse.access.https.%s" % (site_tag,),
-                        site_tag,
-                        listener_config,
-                        root_resource,
-                    ),
-                    self.tls_server_context_factory,
-                    interface=address
-                )
+            ports = listen_ssl(
+                bind_addresses,
+                port,
+                SynapseSite(
+                    "synapse.access.https.%s" % (site_tag,),
+                    site_tag,
+                    listener_config,
+                    root_resource,
+                    self.version_string,
+                ),
+                self.tls_server_context_factory,
+                reactor=self.get_reactor(),
+            )
+            logger.info("Synapse now listening on TCP port %d (TLS)", port)
+
         else:
-            for address in bind_addresses:
-                reactor.listenTCP(
-                    port,
-                    SynapseSite(
-                        "synapse.access.http.%s" % (site_tag,),
-                        site_tag,
-                        listener_config,
-                        root_resource,
-                    ),
-                    interface=address
-                )
-        logger.info("Synapse now listening on port %d", port)
+            ports = listen_tcp(
+                bind_addresses,
+                port,
+                SynapseSite(
+                    "synapse.access.http.%s" % (site_tag,),
+                    site_tag,
+                    listener_config,
+                    root_resource,
+                    self.version_string,
+                ),
+                reactor=self.get_reactor(),
+            )
+            logger.info("Synapse now listening on TCP port %d", port)
 
-    def start_listening(self):
-        config = self.get_config()
+        return ports
 
-        for listener in config.listeners:
-            if listener["type"] == "http":
-                self._listener_http(config, listener)
-            elif listener["type"] == "manhole":
-                bind_addresses = listener["bind_addresses"]
+    def _configure_named_resource(self, name, compress=False):
+        """Build a resource map for a named resource
 
-                for address in bind_addresses:
-                    reactor.listenTCP(
-                        listener["port"],
-                        manhole(
-                            username="matrix",
-                            password="rabbithole",
-                            globals={"hs": self},
-                        ),
-                        interface=address
-                    )
-            elif listener["type"] == "replication":
-                bind_addresses = listener["bind_addresses"]
-                for address in bind_addresses:
-                    factory = ReplicationStreamProtocolFactory(self)
-                    server_listener = reactor.listenTCP(
-                        listener["port"], factory, interface=address
-                    )
-                    reactor.addSystemEventTrigger(
-                        "before", "shutdown", server_listener.stopListening,
-                    )
-            else:
-                logger.warn("Unrecognized listener type: %s", listener["type"])
+        Args:
+            name (str): named resource: one of "client", "federation", etc
+            compress (bool): whether to enable gzip compression for this
+                resource
 
-    def run_startup_checks(self, db_conn, database_engine):
-        all_users_native = are_all_users_on_domain(
-            db_conn.cursor(), database_engine, self.hostname
-        )
-        if not all_users_native:
-            quit_with_error(
-                "Found users in database not native to %s!\n"
-                "You cannot changed a synapse server_name after it's been configured"
-                % (self.hostname,)
+        Returns:
+            dict[str, Resource]: map from path to HTTP resource
+        """
+        resources = {}
+        if name == "client":
+            client_resource = ClientRestResource(self)
+            if compress:
+                client_resource = gz_wrap(client_resource)
+
+            resources.update(
+                {
+                    "/_matrix/client/api/v1": client_resource,
+                    "/_matrix/client/r0": client_resource,
+                    "/_matrix/client/unstable": client_resource,
+                    "/_matrix/client/v2_alpha": client_resource,
+                    "/_matrix/client/versions": client_resource,
+                    "/.well-known/matrix/client": WellKnownResource(self),
+                    "/_synapse/admin": AdminRestResource(self),
+                }
             )
 
-        try:
-            database_engine.check_database(db_conn.cursor())
-        except IncorrectDatabaseSetup as e:
-            quit_with_error(e.message)
+            if self.get_config().saml2_enabled:
+                from synapse.rest.saml2 import SAML2Resource
 
-    def get_db_conn(self, run_new_connection=True):
-        # Any param beginning with cp_ is a parameter for adbapi, and should
-        # not be passed to the database engine.
-        db_params = {
-            k: v for k, v in self.db_config.get("args", {}).items()
-            if not k.startswith("cp_")
-        }
-        db_conn = self.database_engine.module.connect(**db_params)
+                resources["/_matrix/saml2"] = SAML2Resource(self)
 
-        if run_new_connection:
-            self.database_engine.on_new_connection(db_conn)
-        return db_conn
+        if name == "consent":
+            from synapse.rest.consent.consent_resource import ConsentResource
+
+            consent_resource = ConsentResource(self)
+            if compress:
+                consent_resource = gz_wrap(consent_resource)
+            resources.update({"/_matrix/consent": consent_resource})
+
+        if name == "federation":
+            resources.update({FEDERATION_PREFIX: TransportLayerServer(self)})
+
+        if name == "openid":
+            resources.update(
+                {
+                    FEDERATION_PREFIX: TransportLayerServer(
+                        self, servlet_groups=["openid"]
+                    )
+                }
+            )
+
+        if name in ["static", "client"]:
+            resources.update(
+                {
+                    STATIC_PREFIX: File(
+                        os.path.join(os.path.dirname(synapse.__file__), "static")
+                    )
+                }
+            )
+
+        if name in ["media", "federation", "client"]:
+            if self.get_config().enable_media_repo:
+                media_repo = self.get_media_repository_resource()
+                resources.update(
+                    {MEDIA_PREFIX: media_repo, LEGACY_MEDIA_PREFIX: media_repo}
+                )
+            elif name == "media":
+                raise ConfigError(
+                    "'media' resource conflicts with enable_media_repo=False"
+                )
+
+        if name in ["keys", "federation"]:
+            resources[SERVER_KEY_V2_PREFIX] = KeyApiV2Resource(self)
+
+        if name == "webclient":
+            webclient_path = self.get_config().web_client_location
+
+            if webclient_path is None:
+                logger.warning(
+                    "Not enabling webclient resource, as web_client_location is unset."
+                )
+            else:
+                # GZip is disabled here due to
+                # https://twistedmatrix.com/trac/ticket/7678
+                resources[WEB_CLIENT_PREFIX] = File(webclient_path)
+
+        if name == "metrics" and self.get_config().enable_metrics:
+            resources[METRICS_PREFIX] = MetricsResource(RegistryProxy)
+
+        if name == "replication":
+            resources[REPLICATION_PREFIX] = ReplicationRestResource(self)
+
+        return resources
+
+    def start_listening(self, listeners):
+        config = self.get_config()
+
+        for listener in listeners:
+            if listener["type"] == "http":
+                self._listening_services.extend(self._listener_http(config, listener))
+            elif listener["type"] == "manhole":
+                listen_tcp(
+                    listener["bind_addresses"],
+                    listener["port"],
+                    manhole(
+                        username="matrix", password="rabbithole", globals={"hs": self}
+                    ),
+                )
+            elif listener["type"] == "replication":
+                services = listen_tcp(
+                    listener["bind_addresses"],
+                    listener["port"],
+                    ReplicationStreamProtocolFactory(self),
+                )
+                for s in services:
+                    reactor.addSystemEventTrigger("before", "shutdown", s.stopListening)
+            elif listener["type"] == "metrics":
+                if not self.get_config().enable_metrics:
+                    logger.warning(
+                        (
+                            "Metrics listener configured, but "
+                            "enable_metrics is not True!"
+                        )
+                    )
+                else:
+                    _base.listen_metrics(listener["bind_addresses"], listener["port"])
+            else:
+                logger.warning("Unrecognized listener type: %s", listener["type"])
 
 
-def quit_with_error(error_string):
-    message_lines = error_string.split("\n")
-    line_length = max([len(l) for l in message_lines if len(l) < 80]) + 2
-    sys.stderr.write("*" * line_length + '\n')
-    for line in message_lines:
-        sys.stderr.write(" %s\n" % (line.rstrip(),))
-    sys.stderr.write("*" * line_length + '\n')
-    sys.exit(1)
+# Gauges to expose monthly active user control metrics
+current_mau_gauge = Gauge("synapse_admin_mau:current", "Current MAU")
+current_mau_by_service_gauge = Gauge(
+    "synapse_admin_mau_current_mau_by_service",
+    "Current MAU by service",
+    ["app_service"],
+)
+max_mau_gauge = Gauge("synapse_admin_mau:max", "MAU Limit")
+registered_reserved_users_mau_gauge = Gauge(
+    "synapse_admin_mau:registered_reserved_users",
+    "Registered users with reserved threepids",
+)
 
 
 def setup(config_options):
@@ -283,11 +321,10 @@ def setup(config_options):
     """
     try:
         config = HomeServerConfig.load_or_generate_config(
-            "Synapse Homeserver",
-            config_options,
+            "Synapse Homeserver", config_options
         )
     except ConfigError as e:
-        sys.stderr.write("\n" + e.message + "\n")
+        sys.stderr.write("\nERROR: %s\n" % (e,))
         sys.exit(1)
 
     if not config:
@@ -295,63 +332,93 @@ def setup(config_options):
         # generating config files and shouldn't try to continue.
         sys.exit(0)
 
-    synapse.config.logger.setup_logging(config, use_worker_options=False)
-
-    # check any extra requirements we have now we have a config
-    check_requirements(config)
-
-    version_string = "Synapse/" + get_version_string(synapse)
-
-    logger.info("Server hostname: %s", config.server_name)
-    logger.info("Server version: %s", version_string)
-
     events.USE_FROZEN_DICTS = config.use_frozen_dicts
-
-    tls_server_context_factory = context_factory.ServerContextFactory(config)
-
-    database_engine = create_engine(config.database_config)
-    config.database_config["args"]["cp_openfun"] = database_engine.on_new_connection
 
     hs = SynapseHomeServer(
         config.server_name,
-        db_config=config.database_config,
-        tls_server_context_factory=tls_server_context_factory,
         config=config,
-        version_string=version_string,
-        database_engine=database_engine,
+        version_string="Synapse/" + get_version_string(synapse),
     )
 
-    logger.info("Preparing database: %s...", config.database_config['name'])
+    synapse.config.logger.setup_logging(hs, config, use_worker_options=False)
+
+    logger.info("Setting up server")
 
     try:
-        db_conn = hs.get_db_conn(run_new_connection=False)
-        prepare_database(db_conn, database_engine, config=config)
-        database_engine.on_new_connection(db_conn)
+        hs.setup()
+    except IncorrectDatabaseSetup as e:
+        quit_with_error(str(e))
+    except UpgradeDatabaseException as e:
+        quit_with_error("Failed to upgrade database: %s" % (e,))
 
-        hs.run_startup_checks(db_conn, database_engine)
+    hs.setup_master()
 
-        db_conn.commit()
-    except UpgradeDatabaseException:
-        sys.stderr.write(
-            "\nFailed to upgrade database.\n"
-            "Have you checked for version specific instructions in"
-            " UPGRADES.rst?\n"
-        )
-        sys.exit(1)
+    @defer.inlineCallbacks
+    def do_acme():
+        """
+        Reprovision an ACME certificate, if it's required.
 
-    logger.info("Database prepared in %s.", config.database_config['name'])
+        Returns:
+            Deferred[bool]: Whether the cert has been updated.
+        """
+        acme = hs.get_acme_handler()
 
-    hs.setup()
-    hs.start_listening()
+        # Check how long the certificate is active for.
+        cert_days_remaining = hs.config.is_disk_cert_valid(allow_self_signed=False)
 
+        # We want to reprovision if cert_days_remaining is None (meaning no
+        # certificate exists), or the days remaining number it returns
+        # is less than our re-registration threshold.
+        provision = False
+
+        if (
+            cert_days_remaining is None
+            or cert_days_remaining < hs.config.acme_reprovision_threshold
+        ):
+            provision = True
+
+        if provision:
+            yield acme.provision_certificate()
+
+        return provision
+
+    @defer.inlineCallbacks
+    def reprovision_acme():
+        """
+        Provision a certificate from ACME, if required, and reload the TLS
+        certificate if it's renewed.
+        """
+        reprovisioned = yield do_acme()
+        if reprovisioned:
+            _base.refresh_certificate(hs)
+
+    @defer.inlineCallbacks
     def start():
-        hs.get_pusherpool().start()
-        hs.get_state_handler().start_caching()
-        hs.get_datastore().start_profiling()
-        hs.get_datastore().start_doing_background_updates()
-        hs.get_replication_layer().start_get_pdu_cache()
+        try:
+            # Run the ACME provisioning code, if it's enabled.
+            if hs.config.acme_enabled:
+                acme = hs.get_acme_handler()
+                # Start up the webservices which we will respond to ACME
+                # challenges with, and then provision.
+                yield acme.start_listening()
+                yield do_acme()
 
-        register_memory_metrics(hs)
+                # Check if it needs to be reprovisioned every day.
+                hs.get_clock().looping_call(reprovision_acme, 24 * 60 * 60 * 1000)
+
+            _base.start(hs, config.listeners)
+
+            hs.get_datastore().db.updates.start_doing_background_updates()
+        except Exception:
+            # Print the exception and bail out.
+            print("Error during startup:", file=sys.stderr)
+
+            # this gives better tracebacks than traceback.print_exc()
+            Failure().printTraceback(file=sys.stderr)
+
+            if reactor.running:
+                reactor.stop()
+            sys.exit(1)
 
     reactor.callWhenRunning(start)
 
@@ -359,9 +426,11 @@ def setup(config_options):
 
 
 class SynapseService(service.Service):
-    """A twisted Service class that will start synapse. Used to run synapse
+    """
+    A twisted Service class that will start synapse. Used to run synapse
     via twistd and a .tac.
     """
+
     def __init__(self, config):
         self.config = config
 
@@ -375,9 +444,93 @@ class SynapseService(service.Service):
         return self._port.stopListening()
 
 
+# Contains the list of processes we will be monitoring
+# currently either 0 or 1
+_stats_process = []
+
+
+@defer.inlineCallbacks
+def phone_stats_home(hs, stats, stats_process=_stats_process):
+    logger.info("Gathering stats for reporting")
+    now = int(hs.get_clock().time())
+    uptime = int(now - hs.start_time)
+    if uptime < 0:
+        uptime = 0
+
+    stats["homeserver"] = hs.config.server_name
+    stats["server_context"] = hs.config.server_context
+    stats["timestamp"] = now
+    stats["uptime_seconds"] = uptime
+    version = sys.version_info
+    stats["python_version"] = "{}.{}.{}".format(
+        version.major, version.minor, version.micro
+    )
+    stats["total_users"] = yield hs.get_datastore().count_all_users()
+
+    total_nonbridged_users = yield hs.get_datastore().count_nonbridged_users()
+    stats["total_nonbridged_users"] = total_nonbridged_users
+
+    daily_user_type_results = yield hs.get_datastore().count_daily_user_type()
+    for name, count in iteritems(daily_user_type_results):
+        stats["daily_user_type_" + name] = count
+
+    room_count = yield hs.get_datastore().get_room_count()
+    stats["total_room_count"] = room_count
+
+    stats["daily_active_users"] = yield hs.get_datastore().count_daily_users()
+    stats["monthly_active_users"] = yield hs.get_datastore().count_monthly_users()
+    stats["daily_active_rooms"] = yield hs.get_datastore().count_daily_active_rooms()
+    stats["daily_messages"] = yield hs.get_datastore().count_daily_messages()
+
+    r30_results = yield hs.get_datastore().count_r30_users()
+    for name, count in iteritems(r30_results):
+        stats["r30_users_" + name] = count
+
+    daily_sent_messages = yield hs.get_datastore().count_daily_sent_messages()
+    stats["daily_sent_messages"] = daily_sent_messages
+    stats["cache_factor"] = CACHE_SIZE_FACTOR
+    stats["event_cache_size"] = hs.config.event_cache_size
+
+    #
+    # Performance statistics
+    #
+    old = stats_process[0]
+    new = (now, resource.getrusage(resource.RUSAGE_SELF))
+    stats_process[0] = new
+
+    # Get RSS in bytes
+    stats["memory_rss"] = new[1].ru_maxrss
+
+    # Get CPU time in % of a single core, not % of all cores
+    used_cpu_time = (new[1].ru_utime + new[1].ru_stime) - (
+        old[1].ru_utime + old[1].ru_stime
+    )
+    if used_cpu_time == 0 or new[0] == old[0]:
+        stats["cpu_average"] = 0
+    else:
+        stats["cpu_average"] = math.floor(used_cpu_time / (new[0] - old[0]) * 100)
+
+    #
+    # Database version
+    #
+
+    # This only reports info about the *main* database.
+    stats["database_engine"] = hs.get_datastore().db.engine.module.__name__
+    stats["database_server_version"] = hs.get_datastore().db.engine.server_version
+
+    logger.info("Reporting stats to %s: %s" % (hs.config.report_stats_endpoint, stats))
+    try:
+        yield hs.get_proxied_http_client().put_json(
+            hs.config.report_stats_endpoint, stats
+        )
+    except Exception as e:
+        logger.warning("Error reporting stats: %s", e)
+
+
 def run(hs):
     PROFILE_SYNAPSE = False
     if PROFILE_SYNAPSE:
+
         def profile(func):
             from cProfile import Profile
             from threading import current_thread
@@ -388,95 +541,102 @@ def run(hs):
                 func(*args, **kargs)
                 profile.disable()
                 ident = current_thread().ident
-                profile.dump_stats("/tmp/%s.%s.%i.pstat" % (
-                    hs.hostname, func.__name__, ident
-                ))
+                profile.dump_stats(
+                    "/tmp/%s.%s.%i.pstat" % (hs.hostname, func.__name__, ident)
+                )
 
             return profiled
 
         from twisted.python.threadpool import ThreadPool
+
         ThreadPool._worker = profile(ThreadPool._worker)
         reactor.run = profile(reactor.run)
 
     clock = hs.get_clock()
-    start_time = clock.time()
 
     stats = {}
 
+    def performance_stats_init():
+        _stats_process.clear()
+        _stats_process.append(
+            (int(hs.get_clock().time()), resource.getrusage(resource.RUSAGE_SELF))
+        )
+
+    def start_phone_stats_home():
+        return run_as_background_process(
+            "phone_stats_home", phone_stats_home, hs, stats
+        )
+
+    def generate_user_daily_visit_stats():
+        return run_as_background_process(
+            "generate_user_daily_visits", hs.get_datastore().generate_user_daily_visits
+        )
+
+    # Rather than update on per session basis, batch up the requests.
+    # If you increase the loop period, the accuracy of user_daily_visits
+    # table will decrease
+    clock.looping_call(generate_user_daily_visit_stats, 5 * 60 * 1000)
+
+    # monthly active user limiting functionality
+    def reap_monthly_active_users():
+        return run_as_background_process(
+            "reap_monthly_active_users", hs.get_datastore().reap_monthly_active_users
+        )
+
+    clock.looping_call(reap_monthly_active_users, 1000 * 60 * 60)
+    reap_monthly_active_users()
+
     @defer.inlineCallbacks
-    def phone_stats_home():
-        logger.info("Gathering stats for reporting")
-        now = int(hs.get_clock().time())
-        uptime = int(now - start_time)
-        if uptime < 0:
-            uptime = 0
-
-        stats["homeserver"] = hs.config.server_name
-        stats["timestamp"] = now
-        stats["uptime_seconds"] = uptime
-        stats["total_users"] = yield hs.get_datastore().count_all_users()
-
-        total_nonbridged_users = yield hs.get_datastore().count_nonbridged_users()
-        stats["total_nonbridged_users"] = total_nonbridged_users
-
-        room_count = yield hs.get_datastore().get_room_count()
-        stats["total_room_count"] = room_count
-
-        stats["daily_active_users"] = yield hs.get_datastore().count_daily_users()
-        stats["daily_active_rooms"] = yield hs.get_datastore().count_daily_active_rooms()
-        stats["daily_messages"] = yield hs.get_datastore().count_daily_messages()
-
-        daily_sent_messages = yield hs.get_datastore().count_daily_sent_messages()
-        stats["daily_sent_messages"] = daily_sent_messages
-
-        logger.info("Reporting stats to matrix.org: %s" % (stats,))
-        try:
-            yield hs.get_simple_http_client().put_json(
-                "https://matrix.org/report-usage-stats/push",
-                stats
+    def generate_monthly_active_users():
+        current_mau_count = 0
+        current_mau_count_by_service = {}
+        reserved_users = ()
+        store = hs.get_datastore()
+        if hs.config.limit_usage_by_mau or hs.config.mau_stats_only:
+            current_mau_count = yield store.get_monthly_active_count()
+            current_mau_count_by_service = (
+                yield store.get_monthly_active_count_by_service()
             )
-        except Exception as e:
-            logger.warn("Error reporting stats: %s", e)
+            reserved_users = yield store.get_registered_reserved_users()
+        current_mau_gauge.set(float(current_mau_count))
+
+        for app_service, count in current_mau_count_by_service.items():
+            current_mau_by_service_gauge.labels(app_service).set(float(count))
+
+        registered_reserved_users_mau_gauge.set(float(len(reserved_users)))
+        max_mau_gauge.set(float(hs.config.max_mau_value))
+
+    def start_generate_monthly_active_users():
+        return run_as_background_process(
+            "generate_monthly_active_users", generate_monthly_active_users
+        )
+
+    start_generate_monthly_active_users()
+    if hs.config.limit_usage_by_mau or hs.config.mau_stats_only:
+        clock.looping_call(start_generate_monthly_active_users, 5 * 60 * 1000)
+    # End of monthly active user settings
 
     if hs.config.report_stats:
         logger.info("Scheduling stats reporting for 3 hour intervals")
-        clock.looping_call(phone_stats_home, 3 * 60 * 60 * 1000)
+        clock.looping_call(start_phone_stats_home, 3 * 60 * 60 * 1000)
+
+        # We need to defer this init for the cases that we daemonize
+        # otherwise the process ID we get is that of the non-daemon process
+        clock.call_later(0, performance_stats_init)
 
         # We wait 5 minutes to send the first set of stats as the server can
         # be quite busy the first few minutes
-        clock.call_later(5 * 60, phone_stats_home)
+        clock.call_later(5 * 60, start_phone_stats_home)
 
-    def in_thread():
-        # Uncomment to enable tracing of log context changes.
-        # sys.settrace(logcontext_tracer)
-
-        # make sure that we run the reactor with the sentinel log context,
-        # otherwise other PreserveLoggingContext instances will get confused
-        # and complain when they see the logcontext arbitrarily swapping
-        # between the sentinel and `run` logcontexts.
-        with PreserveLoggingContext():
-            change_resource_limit(hs.config.soft_file_limit)
-            if hs.config.gc_thresholds:
-                gc.set_threshold(*hs.config.gc_thresholds)
-            reactor.run()
-
-    if hs.config.daemonize:
-
-        if hs.config.print_pidfile:
-            print (hs.config.pid_file)
-
-        daemon = Daemonize(
-            app="synapse-homeserver",
-            pid=hs.config.pid_file,
-            action=lambda: in_thread(),
-            auto_close_fds=False,
-            verbose=True,
-            logger=logger,
-        )
-
-        daemon.start()
-    else:
-        in_thread()
+    _base.start_reactor(
+        "synapse-homeserver",
+        soft_file_limit=hs.config.soft_file_limit,
+        gc_thresholds=hs.config.gc_thresholds,
+        pid_file=hs.config.pid_file,
+        daemonize=hs.config.daemonize,
+        print_pidfile=hs.config.print_pidfile,
+        logger=logger,
+    )
 
 
 def main():
@@ -487,5 +647,5 @@ def main():
         run(hs)
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

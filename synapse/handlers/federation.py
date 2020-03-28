@@ -1,5 +1,7 @@
 # -*- coding: utf-8 -*-
 # Copyright 2014-2016 OpenMarket Ltd
+# Copyright 2017-2018 New Vector Ltd
+# Copyright 2019 The Matrix.org Foundation C.I.C.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -14,52 +16,111 @@
 # limitations under the License.
 
 """Contains handlers for federation events."""
-import synapse.util.logcontext
+
+import itertools
+import logging
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+
+import six
+from six import iteritems, itervalues
+from six.moves import http_client, zip
+
+import attr
 from signedjson.key import decode_verify_key_bytes
 from signedjson.sign import verify_signed_json
 from unpaddedbase64 import decode_base64
 
-from ._base import BaseHandler
-
-from synapse.api.errors import (
-    AuthError, FederationError, StoreError, CodeMessageException, SynapseError,
-)
-from synapse.api.constants import EventTypes, Membership, RejectedReason
-from synapse.events.validator import EventValidator
-from synapse.util import unwrapFirstError
-from synapse.util.logcontext import (
-    preserve_fn, preserve_context_over_deferred
-)
-from synapse.util.metrics import measure_func
-from synapse.util.logutils import log_function
-from synapse.util.async import run_on_reactor, Linearizer
-from synapse.util.frozenutils import unfreeze
-from synapse.crypto.event_signing import (
-    compute_event_signature, add_hashes_and_signatures,
-)
-from synapse.types import UserID, get_domain_from_id
-
-from synapse.events.utils import prune_event
-
-from synapse.util.retryutils import NotRetryingDestination
-
-from synapse.util.distributor import user_joined_room
-
 from twisted.internet import defer
 
-import itertools
-import logging
+from synapse import event_auth
+from synapse.api.constants import EventTypes, Membership, RejectedReason
+from synapse.api.errors import (
+    AuthError,
+    CodeMessageException,
+    Codes,
+    FederationDeniedError,
+    FederationError,
+    RequestSendFailed,
+    SynapseError,
+)
+from synapse.api.room_versions import KNOWN_ROOM_VERSIONS, RoomVersion, RoomVersions
+from synapse.crypto.event_signing import compute_event_signature
+from synapse.event_auth import auth_types_for_event
+from synapse.events import EventBase
+from synapse.events.snapshot import EventContext
+from synapse.events.validator import EventValidator
+from synapse.logging.context import (
+    make_deferred_yieldable,
+    nested_logging_context,
+    preserve_fn,
+    run_in_background,
+)
+from synapse.logging.utils import log_function
+from synapse.replication.http.devices import ReplicationUserDevicesResyncRestServlet
+from synapse.replication.http.federation import (
+    ReplicationCleanRoomRestServlet,
+    ReplicationFederationSendEventsRestServlet,
+    ReplicationStoreRoomOnInviteRestServlet,
+)
+from synapse.replication.http.membership import ReplicationUserJoinedLeftRoomRestServlet
+from synapse.state import StateResolutionStore, resolve_events_with_store
+from synapse.storage.data_stores.main.events_worker import EventRedactBehaviour
+from synapse.types import JsonDict, StateMap, UserID, get_domain_from_id
+from synapse.util.async_helpers import Linearizer, concurrently_execute
+from synapse.util.distributor import user_joined_room
+from synapse.util.retryutils import NotRetryingDestination
+from synapse.visibility import filter_events_for_server
+
+from ._base import BaseHandler
 
 logger = logging.getLogger(__name__)
+
+
+@attr.s
+class _NewEventInfo:
+    """Holds information about a received event, ready for passing to _handle_new_events
+
+    Attributes:
+        event: the received event
+
+        state: the state at that event
+
+        auth_events: the auth_event map for that event
+    """
+
+    event = attr.ib(type=EventBase)
+    state = attr.ib(type=Optional[Sequence[EventBase]], default=None)
+    auth_events = attr.ib(type=Optional[StateMap[EventBase]], default=None)
+
+
+def shortstr(iterable, maxitems=5):
+    """If iterable has maxitems or fewer, return the stringification of a list
+    containing those items.
+
+    Otherwise, return the stringification of a a list with the first maxitems items,
+    followed by "...".
+
+    Args:
+        iterable (Iterable): iterable to truncate
+        maxitems (int): number of items to return before truncating
+
+    Returns:
+        unicode
+    """
+
+    items = list(itertools.islice(iterable, maxitems + 1))
+    if len(items) <= maxitems:
+        return str(items)
+    return "[" + ", ".join(repr(r) for r in items[:maxitems]) + ", ...]"
 
 
 class FederationHandler(BaseHandler):
     """Handles events that originated from federation.
         Responsible for:
         a) handling received Pdus before handing them on as Events to the rest
-        of the home server (including auth and state conflict resoultion)
+        of the homeserver (including auth and state conflict resoultion)
         b) converting events that were produced by local clients that may need
-        to be sent to remote home servers.
+        to be sent to remote homeservers.
         c) doing the necessary dances to invite remote users and join remote
         rooms.
     """
@@ -70,23 +131,52 @@ class FederationHandler(BaseHandler):
         self.hs = hs
 
         self.store = hs.get_datastore()
-        self.replication_layer = hs.get_replication_layer()
+        self.storage = hs.get_storage()
+        self.state_store = self.storage.state
+        self.federation_client = hs.get_federation_client()
         self.state_handler = hs.get_state_handler()
         self.server_name = hs.hostname
         self.keyring = hs.get_keyring()
         self.action_generator = hs.get_action_generator()
         self.is_mine_id = hs.is_mine_id
         self.pusher_pool = hs.get_pusherpool()
+        self.spam_checker = hs.get_spam_checker()
+        self.event_creation_handler = hs.get_event_creation_handler()
+        self._message_handler = hs.get_message_handler()
+        self._server_notices_mxid = hs.config.server_notices_mxid
+        self.config = hs.config
+        self.http_client = hs.get_simple_http_client()
 
-        self.replication_layer.set_handler(self)
+        self._send_events_to_master = ReplicationFederationSendEventsRestServlet.make_client(
+            hs
+        )
+        self._notify_user_membership_change = ReplicationUserJoinedLeftRoomRestServlet.make_client(
+            hs
+        )
+        self._clean_room_for_join_client = ReplicationCleanRoomRestServlet.make_client(
+            hs
+        )
+
+        if hs.config.worker_app:
+            self._user_device_resync = ReplicationUserDevicesResyncRestServlet.make_client(
+                hs
+            )
+            self._maybe_store_room_on_invite = ReplicationStoreRoomOnInviteRestServlet.make_client(
+                hs
+            )
+        else:
+            self._device_list_updater = hs.get_device_handler().device_list_updater
+            self._maybe_store_room_on_invite = self.store.maybe_store_room_on_invite
 
         # When joining a room we need to queue any events for that room up
         self.room_queues = {}
         self._room_pdu_linearizer = Linearizer("fed_room_pdu")
 
-    @defer.inlineCallbacks
-    @log_function
-    def on_receive_pdu(self, origin, pdu, get_missing=True):
+        self.third_party_event_rules = hs.get_third_party_event_rules()
+
+        self._ephemeral_messages_enabled = hs.config.enable_ephemeral_messages
+
+    async def on_receive_pdu(self, origin, pdu, sent_to_us_directly=False) -> None:
         """ Process a PDU received via a federation /send/ transaction, or
         via backfill of missing prev_events
 
@@ -94,132 +184,254 @@ class FederationHandler(BaseHandler):
             origin (str): server which initiated the /send/ transaction. Will
                 be used to fetch missing events or state.
             pdu (FrozenEvent): received PDU
-            get_missing (bool): True if we should fetch missing prev_events
-
-        Returns (Deferred): completes with None
+            sent_to_us_directly (bool): True if this event was pushed to us; False if
+                we pulled it as the result of a missing prev_event.
         """
 
+        room_id = pdu.room_id
+        event_id = pdu.event_id
+
+        logger.info("handling received PDU: %s", pdu)
+
         # We reprocess pdus when we have seen them only as outliers
-        existing = yield self.get_persisted_pdu(
-            origin, pdu.event_id, do_auth=False
+        existing = await self.store.get_event(
+            event_id, allow_none=True, allow_rejected=True
         )
 
         # FIXME: Currently we fetch an event again when we already have it
         # if it has been marked as an outlier.
 
-        already_seen = (
-            existing and (
-                not existing.internal_metadata.is_outlier()
-                or pdu.internal_metadata.is_outlier()
-            )
+        already_seen = existing and (
+            not existing.internal_metadata.is_outlier()
+            or pdu.internal_metadata.is_outlier()
         )
         if already_seen:
-            logger.debug("Already seen pdu %s", pdu.event_id)
+            logger.debug("[%s %s]: Already seen pdu", room_id, event_id)
             return
+
+        # do some initial sanity-checking of the event. In particular, make
+        # sure it doesn't have hundreds of prev_events or auth_events, which
+        # could cause a huge state resolution or cascade of event fetches.
+        try:
+            self._sanity_check_event(pdu)
+        except SynapseError as err:
+            logger.warning(
+                "[%s %s] Received event failed sanity checks", room_id, event_id
+            )
+            raise FederationError("ERROR", err.code, err.msg, affected=pdu.event_id)
 
         # If we are currently in the process of joining this room, then we
         # queue up events for later processing.
-        if pdu.room_id in self.room_queues:
-            logger.info("Ignoring PDU %s for room %s from %s for now; join "
-                        "in progress", pdu.event_id, pdu.room_id, origin)
-            self.room_queues[pdu.room_id].append((pdu, origin))
+        if room_id in self.room_queues:
+            logger.info(
+                "[%s %s] Queuing PDU from %s for now: join in progress",
+                room_id,
+                event_id,
+                origin,
+            )
+            self.room_queues[room_id].append((pdu, origin))
             return
 
+        # If we're not in the room just ditch the event entirely. This is
+        # probably an old server that has come back and thinks we're still in
+        # the room (or we've been rejoined to the room by a state reset).
+        #
+        # Note that if we were never in the room then we would have already
+        # dropped the event, since we wouldn't know the room version.
+        is_in_room = await self.auth.check_host_in_room(room_id, self.server_name)
+        if not is_in_room:
+            logger.info(
+                "[%s %s] Ignoring PDU from %s as we're not in the room",
+                room_id,
+                event_id,
+                origin,
+            )
+            return None
+
         state = None
-
-        auth_chain = []
-
-        have_seen = yield self.store.have_events(
-            [ev for ev, _ in pdu.prev_events]
-        )
-
-        fetch_state = False
 
         # Get missing pdus if necessary.
         if not pdu.internal_metadata.is_outlier():
             # We only backfill backwards to the min depth.
-            min_depth = yield self.get_min_depth_for_context(
-                pdu.room_id
-            )
+            min_depth = await self.get_min_depth_for_context(pdu.room_id)
 
-            logger.debug(
-                "_handle_new_pdu min_depth for %s: %d",
-                pdu.room_id, min_depth
-            )
+            logger.debug("[%s %s] min_depth: %d", room_id, event_id, min_depth)
 
-            prevs = {e_id for e_id, _ in pdu.prev_events}
-            seen = set(have_seen.keys())
+            prevs = set(pdu.prev_event_ids())
+            seen = await self.store.have_seen_events(prevs)
 
-            if min_depth and pdu.depth < min_depth:
+            if min_depth is not None and pdu.depth < min_depth:
                 # This is so that we don't notify the user about this
                 # message, to work around the fact that some events will
                 # reference really really old events we really don't want to
                 # send to the clients.
                 pdu.internal_metadata.outlier = True
-            elif min_depth and pdu.depth > min_depth:
-                if get_missing and prevs - seen:
+            elif min_depth is not None and pdu.depth > min_depth:
+                missing_prevs = prevs - seen
+                if sent_to_us_directly and missing_prevs:
                     # If we're missing stuff, ensure we only fetch stuff one
                     # at a time.
                     logger.info(
-                        "Acquiring lock for room %r to fetch %d missing events: %r...",
-                        pdu.room_id, len(prevs - seen), list(prevs - seen)[:5],
+                        "[%s %s] Acquiring room lock to fetch %d missing prev_events: %s",
+                        room_id,
+                        event_id,
+                        len(missing_prevs),
+                        shortstr(missing_prevs),
                     )
-                    with (yield self._room_pdu_linearizer.queue(pdu.room_id)):
+                    with (await self._room_pdu_linearizer.queue(pdu.room_id)):
                         logger.info(
-                            "Acquired lock for room %r to fetch %d missing events",
-                            pdu.room_id, len(prevs - seen),
+                            "[%s %s] Acquired room lock to fetch %d missing prev_events",
+                            room_id,
+                            event_id,
+                            len(missing_prevs),
                         )
 
-                        yield self._get_missing_events_for_pdu(
-                            origin, pdu, prevs, min_depth
-                        )
+                        try:
+                            await self._get_missing_events_for_pdu(
+                                origin, pdu, prevs, min_depth
+                            )
+                        except Exception as e:
+                            raise Exception(
+                                "Error fetching missing prev_events for %s: %s"
+                                % (event_id, e)
+                            )
 
                         # Update the set of things we've seen after trying to
                         # fetch the missing stuff
-                        have_seen = yield self.store.have_events(prevs)
-                        seen = set(have_seen.iterkeys())
+                        seen = await self.store.have_seen_events(prevs)
 
                         if not prevs - seen:
                             logger.info(
-                                "Found all missing prev events for %s", pdu.event_id
+                                "[%s %s] Found all missing prev_events",
+                                room_id,
+                                event_id,
                             )
-                elif prevs - seen:
-                    logger.info(
-                        "Not fetching %d missing events for room %r,event %s: %r...",
-                        len(prevs - seen), pdu.room_id, pdu.event_id,
-                        list(prevs - seen)[:5],
-                    )
 
             if prevs - seen:
+                # We've still not been able to get all of the prev_events for this event.
+                #
+                # In this case, we need to fall back to asking another server in the
+                # federation for the state at this event. That's ok provided we then
+                # resolve the state against other bits of the DAG before using it (which
+                # will ensure that you can't just take over a room by sending an event,
+                # withholding its prev_events, and declaring yourself to be an admin in
+                # the subsequent state request).
+                #
+                # Now, if we're pulling this event as a missing prev_event, then clearly
+                # this event is not going to become the only forward-extremity and we are
+                # guaranteed to resolve its state against our existing forward
+                # extremities, so that should be fine.
+                #
+                # On the other hand, if this event was pushed to us, it is possible for
+                # it to become the only forward-extremity in the room, and we would then
+                # trust its state to be the state for the whole room. This is very bad.
+                # Further, if the event was pushed to us, there is no excuse for us not to
+                # have all the prev_events. We therefore reject any such events.
+                #
+                # XXX this really feels like it could/should be merged with the above,
+                # but there is an interaction with min_depth that I'm not really
+                # following.
+
+                if sent_to_us_directly:
+                    logger.warning(
+                        "[%s %s] Rejecting: failed to fetch %d prev events: %s",
+                        room_id,
+                        event_id,
+                        len(prevs - seen),
+                        shortstr(prevs - seen),
+                    )
+                    raise FederationError(
+                        "ERROR",
+                        403,
+                        (
+                            "Your server isn't divulging details about prev_events "
+                            "referenced in this event."
+                        ),
+                        affected=pdu.event_id,
+                    )
+
                 logger.info(
-                    "Still missing %d events for room %r: %r...",
-                    len(prevs - seen), pdu.room_id, list(prevs - seen)[:5]
+                    "Event %s is missing prev_events: calculating state for a "
+                    "backwards extremity",
+                    event_id,
                 )
-                fetch_state = True
 
-        if fetch_state:
-            # We need to get the state at this event, since we haven't
-            # processed all the prev events.
-            logger.debug(
-                "_handle_new_pdu getting state for %s",
-                pdu.room_id
-            )
-            try:
-                state, auth_chain = yield self.replication_layer.get_state_for_room(
-                    origin, pdu.room_id, pdu.event_id,
-                )
-            except:
-                logger.exception("Failed to get state for event: %s", pdu.event_id)
+                # Calculate the state after each of the previous events, and
+                # resolve them to find the correct state at the current event.
+                event_map = {event_id: pdu}
+                try:
+                    # Get the state of the events we know about
+                    ours = await self.state_store.get_state_groups_ids(room_id, seen)
 
-        yield self._process_received_pdu(
-            origin,
-            pdu,
-            state=state,
-            auth_chain=auth_chain,
-        )
+                    # state_maps is a list of mappings from (type, state_key) to event_id
+                    state_maps = list(ours.values())  # type: list[StateMap[str]]
 
-    @defer.inlineCallbacks
-    def _get_missing_events_for_pdu(self, origin, pdu, prevs, min_depth):
+                    # we don't need this any more, let's delete it.
+                    del ours
+
+                    # Ask the remote server for the states we don't
+                    # know about
+                    for p in prevs - seen:
+                        logger.info(
+                            "Requesting state at missing prev_event %s", event_id,
+                        )
+
+                        with nested_logging_context(p):
+                            # note that if any of the missing prevs share missing state or
+                            # auth events, the requests to fetch those events are deduped
+                            # by the get_pdu_cache in federation_client.
+                            (remote_state, _,) = await self._get_state_for_room(
+                                origin, room_id, p, include_event_in_state=True
+                            )
+
+                            remote_state_map = {
+                                (x.type, x.state_key): x.event_id for x in remote_state
+                            }
+                            state_maps.append(remote_state_map)
+
+                            for x in remote_state:
+                                event_map[x.event_id] = x
+
+                    room_version = await self.store.get_room_version_id(room_id)
+                    state_map = await resolve_events_with_store(
+                        room_id,
+                        room_version,
+                        state_maps,
+                        event_map,
+                        state_res_store=StateResolutionStore(self.store),
+                    )
+
+                    # We need to give _process_received_pdu the actual state events
+                    # rather than event ids, so generate that now.
+
+                    # First though we need to fetch all the events that are in
+                    # state_map, so we can build up the state below.
+                    evs = await self.store.get_events(
+                        list(state_map.values()),
+                        get_prev_content=False,
+                        redact_behaviour=EventRedactBehaviour.AS_IS,
+                    )
+                    event_map.update(evs)
+
+                    state = [event_map[e] for e in six.itervalues(state_map)]
+                except Exception:
+                    logger.warning(
+                        "[%s %s] Error attempting to resolve state at missing "
+                        "prev_events",
+                        room_id,
+                        event_id,
+                        exc_info=True,
+                    )
+                    raise FederationError(
+                        "ERROR",
+                        403,
+                        "We can't get valid state history.",
+                        affected=event_id,
+                    )
+
+        await self._process_received_pdu(origin, pdu, state=state)
+
+    async def _get_missing_events_for_pdu(self, origin, pdu, prevs, min_depth):
         """
         Args:
             origin (str): Origin of the pdu. Will be called to get the missing events
@@ -227,16 +439,16 @@ class FederationHandler(BaseHandler):
             prevs (set(str)): List of event ids which we are missing
             min_depth (int): Minimum depth of events to return.
         """
-        # We recalculate seen, since it may have changed.
-        have_seen = yield self.store.have_events(prevs)
-        seen = set(have_seen.keys())
+
+        room_id = pdu.room_id
+        event_id = pdu.event_id
+
+        seen = await self.store.have_seen_events(prevs)
 
         if not prevs - seen:
             return
 
-        latest = yield self.store.get_latest_event_ids_in_room(
-            pdu.room_id
-        )
+        latest = await self.store.get_latest_event_ids_in_room(room_id)
 
         # We add the prev events that we have seen to the latest
         # list to ensure the remote server doesn't give them to us
@@ -244,8 +456,11 @@ class FederationHandler(BaseHandler):
         latest |= seen
 
         logger.info(
-            "Missing %d events for room %r pdu %s: %r...",
-            len(prevs - seen), pdu.room_id, pdu.event_id, list(prevs - seen)[:5]
+            "[%s %s]: Requesting missing events between %s and %s",
+            room_id,
+            event_id,
+            shortstr(latest),
+            event_id,
         )
 
         # XXX: we set timeout to 10s to help workaround
@@ -266,144 +481,235 @@ class FederationHandler(BaseHandler):
         # apparently.
         #
         # see https://github.com/matrix-org/synapse/pull/1744
+        #
+        # ----
+        #
+        # Update richvdh 2018/09/18: There are a number of problems with timing this
+        # request out agressively on the client side:
+        #
+        # - it plays badly with the server-side rate-limiter, which starts tarpitting you
+        #   if you send too many requests at once, so you end up with the server carefully
+        #   working through the backlog of your requests, which you have already timed
+        #   out.
+        #
+        # - for this request in particular, we now (as of
+        #   https://github.com/matrix-org/synapse/pull/3456) reject any PDUs where the
+        #   server can't produce a plausible-looking set of prev_events - so we becone
+        #   much more likely to reject the event.
+        #
+        # - contrary to what it says above, we do *not* fall back to fetching fresh state
+        #   for the room if get_missing_events times out. Rather, we give up processing
+        #   the PDU whose prevs we are missing, which then makes it much more likely that
+        #   we'll end up back here for the *next* PDU in the list, which exacerbates the
+        #   problem.
+        #
+        # - the agressive 10s timeout was introduced to deal with incoming federation
+        #   requests taking 8 hours to process. It's not entirely clear why that was going
+        #   on; certainly there were other issues causing traffic storms which are now
+        #   resolved, and I think in any case we may be more sensible about our locking
+        #   now. We're *certainly* more sensible about our logging.
+        #
+        # All that said: Let's try increasing the timout to 60s and see what happens.
 
-        missing_events = yield self.replication_layer.get_missing_events(
-            origin,
-            pdu.room_id,
-            earliest_events_ids=list(latest),
-            latest_events=[pdu],
-            limit=10,
-            min_depth=min_depth,
-            timeout=10000,
-        )
+        try:
+            missing_events = await self.federation_client.get_missing_events(
+                origin,
+                room_id,
+                earliest_events_ids=list(latest),
+                latest_events=[pdu],
+                limit=10,
+                min_depth=min_depth,
+                timeout=60000,
+            )
+        except RequestSendFailed as e:
+            # We failed to get the missing events, but since we need to handle
+            # the case of `get_missing_events` not returning the necessary
+            # events anyway, it is safe to simply log the error and continue.
+            logger.warning(
+                "[%s %s]: Failed to get prev_events: %s", room_id, event_id, e
+            )
+            return
 
         logger.info(
-            "Got %d events: %r...",
-            len(missing_events), [e.event_id for e in missing_events[:5]]
+            "[%s %s]: Got %d prev_events: %s",
+            room_id,
+            event_id,
+            len(missing_events),
+            shortstr(missing_events),
         )
 
         # We want to sort these by depth so we process them and
         # tell clients about them in order.
         missing_events.sort(key=lambda x: x.depth)
 
-        for e in missing_events:
-            logger.info("Handling found event %s", e.event_id)
-            yield self.on_receive_pdu(
-                origin,
-                e,
-                get_missing=False
+        for ev in missing_events:
+            logger.info(
+                "[%s %s] Handling received prev_event %s",
+                room_id,
+                event_id,
+                ev.event_id,
+            )
+            with nested_logging_context(ev.event_id):
+                try:
+                    await self.on_receive_pdu(origin, ev, sent_to_us_directly=False)
+                except FederationError as e:
+                    if e.code == 403:
+                        logger.warning(
+                            "[%s %s] Received prev_event %s failed history check.",
+                            room_id,
+                            event_id,
+                            ev.event_id,
+                        )
+                    else:
+                        raise
+
+    async def _get_state_for_room(
+        self,
+        destination: str,
+        room_id: str,
+        event_id: str,
+        include_event_in_state: bool = False,
+    ) -> Tuple[List[EventBase], List[EventBase]]:
+        """Requests all of the room state at a given event from a remote homeserver.
+
+        Args:
+            destination: The remote homeserver to query for the state.
+            room_id: The id of the room we're interested in.
+            event_id: The id of the event we want the state at.
+            include_event_in_state: if true, the event itself will be included in the
+                returned state event list.
+
+        Returns:
+            A list of events in the state, possibly including the event itself, and
+            a list of events in the auth chain for the given event.
+        """
+        (
+            state_event_ids,
+            auth_event_ids,
+        ) = await self.federation_client.get_room_state_ids(
+            destination, room_id, event_id=event_id
+        )
+
+        desired_events = set(state_event_ids + auth_event_ids)
+
+        if include_event_in_state:
+            desired_events.add(event_id)
+
+        event_map = await self._get_events_from_store_or_dest(
+            destination, room_id, desired_events
+        )
+
+        failed_to_fetch = desired_events - event_map.keys()
+        if failed_to_fetch:
+            logger.warning(
+                "Failed to fetch missing state/auth events for %s %s",
+                event_id,
+                failed_to_fetch,
             )
 
-    @log_function
-    @defer.inlineCallbacks
-    def _process_received_pdu(self, origin, pdu, state, auth_chain):
+        remote_state = [
+            event_map[e_id] for e_id in state_event_ids if e_id in event_map
+        ]
+
+        if include_event_in_state:
+            remote_event = event_map.get(event_id)
+            if not remote_event:
+                raise Exception("Unable to get missing prev_event %s" % (event_id,))
+            if remote_event.is_state() and remote_event.rejected_reason is None:
+                remote_state.append(remote_event)
+
+        auth_chain = [event_map[e_id] for e_id in auth_event_ids if e_id in event_map]
+        auth_chain.sort(key=lambda e: e.depth)
+
+        return remote_state, auth_chain
+
+    async def _get_events_from_store_or_dest(
+        self, destination: str, room_id: str, event_ids: Iterable[str]
+    ) -> Dict[str, EventBase]:
+        """Fetch events from a remote destination, checking if we already have them.
+
+        Persists any events we don't already have as outliers.
+
+        If we fail to fetch any of the events, a warning will be logged, and the event
+        will be omitted from the result. Likewise, any events which turn out not to
+        be in the given room.
+
+        Returns:
+            map from event_id to event
+        """
+        fetched_events = await self.store.get_events(event_ids, allow_rejected=True)
+
+        missing_events = set(event_ids) - fetched_events.keys()
+
+        if missing_events:
+            logger.debug(
+                "Fetching unknown state/auth events %s for room %s",
+                missing_events,
+                room_id,
+            )
+
+            await self._get_events_and_persist(
+                destination=destination, room_id=room_id, events=missing_events
+            )
+
+            # we need to make sure we re-load from the database to get the rejected
+            # state correct.
+            fetched_events.update(
+                (await self.store.get_events(missing_events, allow_rejected=True))
+            )
+
+        # check for events which were in the wrong room.
+        #
+        # this can happen if a remote server claims that the state or
+        # auth_events at an event in room A are actually events in room B
+
+        bad_events = [
+            (event_id, event.room_id)
+            for event_id, event in fetched_events.items()
+            if event.room_id != room_id
+        ]
+
+        for bad_event_id, bad_room_id in bad_events:
+            # This is a bogus situation, but since we may only discover it a long time
+            # after it happened, we try our best to carry on, by just omitting the
+            # bad events from the returned auth/state set.
+            logger.warning(
+                "Remote server %s claims event %s in room %s is an auth/state "
+                "event in room %s",
+                destination,
+                bad_event_id,
+                bad_room_id,
+                room_id,
+            )
+
+            del fetched_events[bad_event_id]
+
+        return fetched_events
+
+    async def _process_received_pdu(
+        self, origin: str, event: EventBase, state: Optional[Iterable[EventBase]],
+    ):
         """ Called when we have a new pdu. We need to do auth checks and put it
         through the StateHandler.
+
+        Args:
+            origin: server sending the event
+
+            event: event to be persisted
+
+            state: Normally None, but if we are handling a gap in the graph
+                (ie, we are missing one or more prev_events), the resolved state at the
+                event
         """
-        event = pdu
+        room_id = event.room_id
+        event_id = event.event_id
 
-        logger.debug("Processing event: %s", event)
+        logger.debug("[%s %s] Processing event: %s", room_id, event_id, event)
 
-        # FIXME (erikj): Awful hack to make the case where we are not currently
-        # in the room work
-        # If state and auth_chain are None, then we don't need to do this check
-        # as we already know we have enough state in the DB to handle this
-        # event.
-        if state and auth_chain and not event.internal_metadata.is_outlier():
-            is_in_room = yield self.auth.check_host_in_room(
-                event.room_id,
-                self.server_name
-            )
-        else:
-            is_in_room = True
-        if not is_in_room:
-            logger.info(
-                "Got event for room we're not in: %r %r",
-                event.room_id, event.event_id
-            )
-
-            try:
-                event_stream_id, max_stream_id = yield self._persist_auth_tree(
-                    origin, auth_chain, state, event
-                )
-            except AuthError as e:
-                raise FederationError(
-                    "ERROR",
-                    e.code,
-                    e.msg,
-                    affected=event.event_id,
-                )
-
-        else:
-            event_ids = set()
-            if state:
-                event_ids |= {e.event_id for e in state}
-            if auth_chain:
-                event_ids |= {e.event_id for e in auth_chain}
-
-            seen_ids = set(
-                (yield self.store.have_events(event_ids)).keys()
-            )
-
-            if state and auth_chain is not None:
-                # If we have any state or auth_chain given to us by the replication
-                # layer, then we should handle them (if we haven't before.)
-
-                event_infos = []
-
-                for e in itertools.chain(auth_chain, state):
-                    if e.event_id in seen_ids:
-                        continue
-                    e.internal_metadata.outlier = True
-                    auth_ids = [e_id for e_id, _ in e.auth_events]
-                    auth = {
-                        (e.type, e.state_key): e for e in auth_chain
-                        if e.event_id in auth_ids or e.type == EventTypes.Create
-                    }
-                    event_infos.append({
-                        "event": e,
-                        "auth_events": auth,
-                    })
-                    seen_ids.add(e.event_id)
-
-                yield self._handle_new_events(origin, event_infos)
-
-            try:
-                context, event_stream_id, max_stream_id = yield self._handle_new_event(
-                    origin,
-                    event,
-                    state=state,
-                )
-            except AuthError as e:
-                raise FederationError(
-                    "ERROR",
-                    e.code,
-                    e.msg,
-                    affected=event.event_id,
-                )
-
-        room = yield self.store.get_room(event.room_id)
-
-        if not room:
-            try:
-                yield self.store.store_room(
-                    room_id=event.room_id,
-                    room_creator_user_id="",
-                    is_public=False,
-                )
-            except StoreError:
-                logger.exception("Failed to store room.")
-
-        extra_users = []
-        if event.type == EventTypes.Member:
-            target_user_id = event.state_key
-            target_user = UserID.from_string(target_user_id)
-            extra_users.append(target_user)
-
-        self.notifier.on_new_room_event(
-            event, event_stream_id, max_stream_id,
-            extra_users=extra_users
-        )
+        try:
+            context = await self._handle_new_event(origin, event, state=state)
+        except AuthError as e:
+            raise FederationError("ERROR", e.code, e.msg, affected=event.event_id)
 
         if event.type == EventTypes.Member:
             if event.membership == Membership.JOIN:
@@ -411,140 +717,145 @@ class FederationHandler(BaseHandler):
                 # joined the room. Don't bother if the user is just
                 # changing their profile info.
                 newly_joined = True
-                prev_state_id = context.prev_state_ids.get(
-                    (event.type, event.state_key)
-                )
+
+                prev_state_ids = await context.get_prev_state_ids()
+
+                prev_state_id = prev_state_ids.get((event.type, event.state_key))
                 if prev_state_id:
-                    prev_state = yield self.store.get_event(
-                        prev_state_id, allow_none=True,
+                    prev_state = await self.store.get_event(
+                        prev_state_id, allow_none=True
                     )
                     if prev_state and prev_state.membership == Membership.JOIN:
                         newly_joined = False
 
                 if newly_joined:
                     user = UserID.from_string(event.state_key)
-                    yield user_joined_room(self.distributor, user, event.room_id)
+                    await self.user_joined_room(user, room_id)
 
-    @measure_func("_filter_events_for_server")
-    @defer.inlineCallbacks
-    def _filter_events_for_server(self, server_name, room_id, events):
-        event_to_state_ids = yield self.store.get_state_ids_for_events(
-            frozenset(e.event_id for e in events),
-            types=(
-                (EventTypes.RoomHistoryVisibility, ""),
-                (EventTypes.Member, None),
-            )
-        )
+        # For encrypted messages we check that we know about the sending device,
+        # if we don't then we mark the device cache for that user as stale.
+        if event.type == EventTypes.Encrypted:
+            device_id = event.content.get("device_id")
+            sender_key = event.content.get("sender_key")
 
-        # We only want to pull out member events that correspond to the
-        # server's domain.
+            cached_devices = await self.store.get_cached_devices_for_user(event.sender)
 
-        def check_match(id):
-            try:
-                return server_name == get_domain_from_id(id)
-            except:
-                return False
+            resync = False  # Whether we should resync device lists.
 
-        # Parses mapping `event_id -> (type, state_key) -> state event_id`
-        # to get all state ids that we're interested in.
-        event_map = yield self.store.get_events([
-            e_id
-            for key_to_eid in event_to_state_ids.values()
-            for key, e_id in key_to_eid.items()
-            if key[0] != EventTypes.Member or check_match(key[1])
-        ])
+            device = None
+            if device_id is not None:
+                device = cached_devices.get(device_id)
+                if device is None:
+                    logger.info(
+                        "Received event from remote device not in our cache: %s %s",
+                        event.sender,
+                        device_id,
+                    )
+                    resync = True
 
-        event_to_state = {
-            e_id: {
-                key: event_map[inner_e_id]
-                for key, inner_e_id in key_to_eid.items()
-                if inner_e_id in event_map
-            }
-            for e_id, key_to_eid in event_to_state_ids.items()
-        }
+            # We also check if the `sender_key` matches what we expect.
+            if sender_key is not None:
+                # Figure out what sender key we're expecting. If we know the
+                # device and recognize the algorithm then we can work out the
+                # exact key to expect. Otherwise check it matches any key we
+                # have for that device.
+                if device:
+                    keys = device.get("keys", {}).get("keys", {})
 
-        def redact_disallowed(event, state):
-            if not state:
-                return event
-
-            history = state.get((EventTypes.RoomHistoryVisibility, ''), None)
-            if history:
-                visibility = history.content.get("history_visibility", "shared")
-                if visibility in ["invited", "joined"]:
-                    # We now loop through all state events looking for
-                    # membership states for the requesting server to determine
-                    # if the server is either in the room or has been invited
-                    # into the room.
-                    for ev in state.values():
-                        if ev.type != EventTypes.Member:
-                            continue
-                        try:
-                            domain = get_domain_from_id(ev.state_key)
-                        except:
-                            continue
-
-                        if domain != server_name:
-                            continue
-
-                        memtype = ev.membership
-                        if memtype == Membership.JOIN:
-                            return event
-                        elif memtype == Membership.INVITE:
-                            if visibility == "invited":
-                                return event
+                    if event.content.get("algorithm") == "m.megolm.v1.aes-sha2":
+                        # For this algorithm we expect a curve25519 key.
+                        key_name = "curve25519:%s" % (device_id,)
+                        current_keys = [keys.get(key_name)]
                     else:
-                        return prune_event(event)
+                        # We don't know understand the algorithm, so we just
+                        # check it matches a key for the device.
+                        current_keys = keys.values()
+                elif device_id:
+                    # We don't have any keys for the device ID.
+                    current_keys = []
+                else:
+                    # The event didn't include a device ID, so we just look for
+                    # keys across all devices.
+                    current_keys = (
+                        key
+                        for device in cached_devices
+                        for key in device.get("keys", {}).get("keys", {}).values()
+                    )
 
-            return event
+                # We now check that the sender key matches (one of) the expected
+                # keys.
+                if sender_key not in current_keys:
+                    logger.info(
+                        "Received event from remote device with unexpected sender key: %s %s: %s",
+                        event.sender,
+                        device_id or "<no device_id>",
+                        sender_key,
+                    )
+                    resync = True
 
-        defer.returnValue([
-            redact_disallowed(e, event_to_state[e.event_id])
-            for e in events
-        ])
+            if resync:
+                await self.store.mark_remote_user_device_cache_as_stale(event.sender)
+
+                # Immediately attempt a resync in the background
+                if self.config.worker_app:
+                    return run_in_background(self._user_device_resync, event.sender)
+                else:
+                    return run_in_background(
+                        self._device_list_updater.user_device_resync, event.sender
+                    )
 
     @log_function
-    @defer.inlineCallbacks
-    def backfill(self, dest, room_id, limit, extremities):
+    async def backfill(self, dest, room_id, limit, extremities):
         """ Trigger a backfill request to `dest` for the given `room_id`
 
-        This will attempt to get more events from the remote. This may return
-        be successfull and still return no events if the other side has no new
-        events to offer.
+        This will attempt to get more events from the remote. If the other side
+        has no new events to offer, this will return an empty list.
+
+        As the events are received, we check their signatures, and also do some
+        sanity-checking on them. If any of the backfilled events are invalid,
+        this method throws a SynapseError.
+
+        TODO: make this more useful to distinguish failures of the remote
+        server from invalid events (there is probably no point in trying to
+        re-fetch invalid events from every other HS in the room.)
         """
         if dest == self.server_name:
             raise SynapseError(400, "Can't backfill from self.")
 
-        events = yield self.replication_layer.backfill(
-            dest,
-            room_id,
-            limit=limit,
-            extremities=extremities,
+        events = await self.federation_client.backfill(
+            dest, room_id, limit=limit, extremities=extremities
         )
 
+        # ideally we'd sanity check the events here for excess prev_events etc,
+        # but it's hard to reject events at this point without completely
+        # breaking backfill in the same way that it is currently broken by
+        # events whose signature we cannot verify (#3121).
+        #
+        # So for now we accept the events anyway. #3124 tracks this.
+        #
+        # for ev in events:
+        #     self._sanity_check_event(ev)
+
         # Don't bother processing events we already have.
-        seen_events = yield self.store.have_events_in_timeline(
-            set(e.event_id for e in events)
+        seen_events = await self.store.have_events_in_timeline(
+            {e.event_id for e in events}
         )
 
         events = [e for e in events if e.event_id not in seen_events]
 
         if not events:
-            defer.returnValue([])
+            return []
 
         event_map = {e.event_id: e for e in events}
 
-        event_ids = set(e.event_id for e in events)
+        event_ids = {e.event_id for e in events}
 
-        edges = [
-            ev.event_id
-            for ev in events
-            if set(e_id for e_id, _ in ev.prev_events) - event_ids
-        ]
+        # build a list of events whose prev_events weren't in the batch.
+        # (XXX: this will include events whose prev_events we already have; that doesn't
+        # sound right?)
+        edges = [ev.event_id for ev in events if set(ev.prev_event_ids()) - event_ids]
 
-        logger.info(
-            "backfill: Got %d events with %d edges",
-            len(events), len(edges),
-        )
+        logger.info("backfill: Got %d events with %d edges", len(events), len(edges))
 
         # For each edge get the current state.
 
@@ -552,136 +863,132 @@ class FederationHandler(BaseHandler):
         state_events = {}
         events_to_state = {}
         for e_id in edges:
-            state, auth = yield self.replication_layer.get_state_for_room(
+            state, auth = await self._get_state_for_room(
                 destination=dest,
                 room_id=room_id,
-                event_id=e_id
+                event_id=e_id,
+                include_event_in_state=False,
             )
             auth_events.update({a.event_id: a for a in auth})
             auth_events.update({s.event_id: s for s in state})
             state_events.update({s.event_id: s for s in state})
             events_to_state[e_id] = state
 
-        required_auth = set(
+        required_auth = {
             a_id
-            for event in events + state_events.values() + auth_events.values()
-            for a_id, _ in event.auth_events
-        )
-        auth_events.update({
-            e_id: event_map[e_id] for e_id in required_auth if e_id in event_map
-        })
-        missing_auth = required_auth - set(auth_events)
-        failed_to_fetch = set()
-
-        # Try and fetch any missing auth events from both DB and remote servers.
-        # We repeatedly do this until we stop finding new auth events.
-        while missing_auth - failed_to_fetch:
-            logger.info("Missing auth for backfill: %r", missing_auth)
-            ret_events = yield self.store.get_events(missing_auth - failed_to_fetch)
-            auth_events.update(ret_events)
-
-            required_auth.update(
-                a_id for event in ret_events.values() for a_id, _ in event.auth_events
-            )
-            missing_auth = required_auth - set(auth_events)
-
-            if missing_auth - failed_to_fetch:
-                logger.info(
-                    "Fetching missing auth for backfill: %r",
-                    missing_auth - failed_to_fetch
-                )
-
-                results = yield preserve_context_over_deferred(defer.gatherResults(
-                    [
-                        preserve_fn(self.replication_layer.get_pdu)(
-                            [dest],
-                            event_id,
-                            outlier=True,
-                            timeout=10000,
-                        )
-                        for event_id in missing_auth - failed_to_fetch
-                    ],
-                    consumeErrors=True
-                )).addErrback(unwrapFirstError)
-                auth_events.update({a.event_id: a for a in results if a})
-                required_auth.update(
-                    a_id
-                    for event in results if event
-                    for a_id, _ in event.auth_events
-                )
-                missing_auth = required_auth - set(auth_events)
-
-                failed_to_fetch = missing_auth - set(auth_events)
-
-        seen_events = yield self.store.have_events(
-            set(auth_events.keys()) | set(state_events.keys())
+            for event in events
+            + list(state_events.values())
+            + list(auth_events.values())
+            for a_id in event.auth_event_ids()
+        }
+        auth_events.update(
+            {e_id: event_map[e_id] for e_id in required_auth if e_id in event_map}
         )
 
         ev_infos = []
-        for a in auth_events.values():
-            if a.event_id in seen_events:
-                continue
-            a.internal_metadata.outlier = True
-            ev_infos.append({
-                "event": a,
-                "auth_events": {
-                    (auth_events[a_id].type, auth_events[a_id].state_key):
-                    auth_events[a_id]
-                    for a_id, _ in a.auth_events
-                    if a_id in auth_events
-                }
-            })
 
+        # Step 1: persist the events in the chunk we fetched state for (i.e.
+        # the backwards extremities), with custom auth events and state
         for e_id in events_to_state:
-            ev_infos.append({
-                "event": event_map[e_id],
-                "state": events_to_state[e_id],
-                "auth_events": {
-                    (auth_events[a_id].type, auth_events[a_id].state_key):
-                    auth_events[a_id]
-                    for a_id, _ in event_map[e_id].auth_events
-                    if a_id in auth_events
-                }
-            })
+            # For paranoia we ensure that these events are marked as
+            # non-outliers
+            ev = event_map[e_id]
+            assert not ev.internal_metadata.is_outlier()
 
-        yield self._handle_new_events(
-            dest, ev_infos,
-            backfilled=True,
-        )
+            ev_infos.append(
+                _NewEventInfo(
+                    event=ev,
+                    state=events_to_state[e_id],
+                    auth_events={
+                        (
+                            auth_events[a_id].type,
+                            auth_events[a_id].state_key,
+                        ): auth_events[a_id]
+                        for a_id in ev.auth_event_ids()
+                        if a_id in auth_events
+                    },
+                )
+            )
 
+        await self._handle_new_events(dest, ev_infos, backfilled=True)
+
+        # Step 2: Persist the rest of the events in the chunk one by one
         events.sort(key=lambda e: e.depth)
 
         for event in events:
             if event in events_to_state:
                 continue
 
+            # For paranoia we ensure that these events are marked as
+            # non-outliers
+            assert not event.internal_metadata.is_outlier()
+
             # We store these one at a time since each event depends on the
             # previous to work out the state.
             # TODO: We can probably do something more clever here.
-            yield self._handle_new_event(
-                dest, event, backfilled=True,
-            )
+            await self._handle_new_event(dest, event, backfilled=True)
 
-        defer.returnValue(events)
+        return events
 
-    @defer.inlineCallbacks
-    def maybe_backfill(self, room_id, current_depth):
+    async def maybe_backfill(self, room_id, current_depth):
         """Checks the database to see if we should backfill before paginating,
         and if so do.
         """
-        extremities = yield self.store.get_oldest_events_with_depth_in_room(
-            room_id
-        )
+        extremities = await self.store.get_oldest_events_with_depth_in_room(room_id)
 
         if not extremities:
             logger.debug("Not backfilling as no extremeties found.")
             return
 
-        # Check if we reached a point where we should start backfilling.
-        sorted_extremeties_tuple = sorted(
-            extremities.items(),
-            key=lambda e: -int(e[1])
+        # We only want to paginate if we can actually see the events we'll get,
+        # as otherwise we'll just spend a lot of resources to get redacted
+        # events.
+        #
+        # We do this by filtering all the backwards extremities and seeing if
+        # any remain. Given we don't have the extremity events themselves, we
+        # need to actually check the events that reference them.
+        #
+        # *Note*: the spec wants us to keep backfilling until we reach the start
+        # of the room in case we are allowed to see some of the history. However
+        # in practice that causes more issues than its worth, as a) its
+        # relatively rare for there to be any visible history and b) even when
+        # there is its often sufficiently long ago that clients would stop
+        # attempting to paginate before backfill reached the visible history.
+        #
+        # TODO: If we do do a backfill then we should filter the backwards
+        #   extremities to only include those that point to visible portions of
+        #   history.
+        #
+        # TODO: Correctly handle the case where we are allowed to see the
+        #   forward event but not the backward extremity, e.g. in the case of
+        #   initial join of the server where we are allowed to see the join
+        #   event but not anything before it. This would require looking at the
+        #   state *before* the event, ignoring the special casing certain event
+        #   types have.
+
+        forward_events = await self.store.get_successor_events(list(extremities))
+
+        extremities_events = await self.store.get_events(
+            forward_events,
+            redact_behaviour=EventRedactBehaviour.AS_IS,
+            get_prev_content=False,
         )
+
+        # We set `check_history_visibility_only` as we might otherwise get false
+        # positives from users having been erased.
+        filtered_extremities = await filter_events_for_server(
+            self.storage,
+            self.server_name,
+            list(extremities_events.values()),
+            redact=False,
+            check_history_visibility_only=True,
+        )
+
+        if not filtered_extremities:
+            return False
+
+        # Check if we reached a point where we should start backfilling.
+        sorted_extremeties_tuple = sorted(extremities.items(), key=lambda e: -int(e[1]))
         max_depth = sorted_extremeties_tuple[0][1]
 
         # We don't want to specify too many extremities as it causes the backfill
@@ -690,8 +997,7 @@ class FederationHandler(BaseHandler):
 
         if current_depth > max_depth:
             logger.debug(
-                "Not backfilling as we don't need to. %d < %d",
-                max_depth, current_depth,
+                "Not backfilling as we don't need to. %d < %d", max_depth, current_depth
             )
             return
 
@@ -700,14 +1006,23 @@ class FederationHandler(BaseHandler):
         # First we try hosts that are already in the room
         # TODO: HEURISTIC ALERT.
 
-        curr_state = yield self.state_handler.get_current_state(room_id)
+        curr_state = await self.state_handler.get_current_state(room_id)
 
         def get_domains_from_state(state):
+            """Get joined domains from state
+
+            Args:
+                state (dict[tuple, FrozenEvent]): State map from type/state
+                    key to event.
+
+            Returns:
+                list[tuple[str, int]]: Returns a list of servers with the
+                lowest depth of their joins. Sorted by lowest depth first.
+            """
             joined_users = [
                 (state_key, int(event.depth))
-                for (e_type, state_key), event in state.items()
-                if e_type == EventTypes.Member
-                and event.membership == Membership.JOIN
+                for (e_type, state_key), event in iteritems(state)
+                if e_type == EventTypes.Member and event.membership == Membership.JOIN
             ]
 
             joined_domains = {}
@@ -719,7 +1034,7 @@ class FederationHandler(BaseHandler):
                         joined_domains[dom] = min(d, old_d)
                     else:
                         joined_domains[dom] = d
-                except:
+                except Exception:
                     pass
 
             return sorted(joined_domains.items(), key=lambda d: d[1])
@@ -727,54 +1042,47 @@ class FederationHandler(BaseHandler):
         curr_domains = get_domains_from_state(curr_state)
 
         likely_domains = [
-            domain for domain, depth in curr_domains
-            if domain != self.server_name
+            domain for domain, depth in curr_domains if domain != self.server_name
         ]
 
-        @defer.inlineCallbacks
-        def try_backfill(domains):
+        async def try_backfill(domains):
             # TODO: Should we try multiple of these at a time?
             for dom in domains:
                 try:
-                    yield self.backfill(
-                        dom, room_id,
-                        limit=100,
-                        extremities=[e for e in extremities.keys()]
+                    await self.backfill(
+                        dom, room_id, limit=100, extremities=extremities
                     )
                     # If this succeeded then we probably already have the
                     # appropriate stuff.
                     # TODO: We can probably do something more intelligent here.
-                    defer.returnValue(True)
+                    return True
                 except SynapseError as e:
-                    logger.info(
-                        "Failed to backfill from %s because %s",
-                        dom, e,
-                    )
+                    logger.info("Failed to backfill from %s because %s", dom, e)
                     continue
                 except CodeMessageException as e:
                     if 400 <= e.code < 500:
                         raise
 
-                    logger.info(
-                        "Failed to backfill from %s because %s",
-                        dom, e,
-                    )
+                    logger.info("Failed to backfill from %s because %s", dom, e)
                     continue
                 except NotRetryingDestination as e:
-                    logger.info(e.message)
+                    logger.info(str(e))
+                    continue
+                except RequestSendFailed as e:
+                    logger.info("Falied to get backfill from %s because %s", dom, e)
+                    continue
+                except FederationDeniedError as e:
+                    logger.info(e)
                     continue
                 except Exception as e:
-                    logger.exception(
-                        "Failed to backfill from %s because %s",
-                        dom, e,
-                    )
+                    logger.exception("Failed to backfill from %s because %s", dom, e)
                     continue
 
-            defer.returnValue(False)
+            return False
 
-        success = yield try_backfill(likely_domains)
+        success = await try_backfill(likely_domains)
         if success:
-            defer.returnValue(True)
+            return True
 
         # Huh, well *those* domains didn't work out. Lets try some domains
         # from the time.
@@ -785,77 +1093,151 @@ class FederationHandler(BaseHandler):
         event_ids = list(extremities.keys())
 
         logger.debug("calling resolve_state_groups in _maybe_backfill")
-        states = yield preserve_context_over_deferred(defer.gatherResults([
-            preserve_fn(self.state_handler.resolve_state_groups)(room_id, [e])
-            for e in event_ids
-        ]))
+        resolve = preserve_fn(self.state_handler.resolve_state_groups_for_events)
+        states = await make_deferred_yieldable(
+            defer.gatherResults(
+                [resolve(room_id, [e]) for e in event_ids], consumeErrors=True
+            )
+        )
+
+        # dict[str, dict[tuple, str]], a map from event_id to state map of
+        # event_ids.
         states = dict(zip(event_ids, [s.state for s in states]))
 
-        state_map = yield self.store.get_events(
-            [e_id for ids in states.values() for e_id in ids],
-            get_prev_content=False
+        state_map = await self.store.get_events(
+            [e_id for ids in itervalues(states) for e_id in itervalues(ids)],
+            get_prev_content=False,
         )
         states = {
             key: {
                 k: state_map[e_id]
-                for k, e_id in state_dict.items()
+                for k, e_id in iteritems(state_dict)
                 if e_id in state_map
-            } for key, state_dict in states.items()
+            }
+            for key, state_dict in iteritems(states)
         }
 
         for e_id, _ in sorted_extremeties_tuple:
             likely_domains = get_domains_from_state(states[e_id])
 
-            success = yield try_backfill([
-                dom for dom in likely_domains
-                if dom not in tried_domains
-            ])
+            success = await try_backfill(
+                [dom for dom, _ in likely_domains if dom not in tried_domains]
+            )
             if success:
-                defer.returnValue(True)
+                return True
 
-            tried_domains.update(likely_domains)
+            tried_domains.update(dom for dom, _ in likely_domains)
 
-        defer.returnValue(False)
+        return False
 
-    @defer.inlineCallbacks
-    def send_invite(self, target_host, event):
+    async def _get_events_and_persist(
+        self, destination: str, room_id: str, events: Iterable[str]
+    ):
+        """Fetch the given events from a server, and persist them as outliers.
+
+        Logs a warning if we can't find the given event.
+        """
+
+        room_version = await self.store.get_room_version(room_id)
+
+        event_infos = []
+
+        async def get_event(event_id: str):
+            with nested_logging_context(event_id):
+                try:
+                    event = await self.federation_client.get_pdu(
+                        [destination], event_id, room_version, outlier=True,
+                    )
+                    if event is None:
+                        logger.warning(
+                            "Server %s didn't return event %s", destination, event_id,
+                        )
+                        return
+
+                    # recursively fetch the auth events for this event
+                    auth_events = await self._get_events_from_store_or_dest(
+                        destination, room_id, event.auth_event_ids()
+                    )
+                    auth = {}
+                    for auth_event_id in event.auth_event_ids():
+                        ae = auth_events.get(auth_event_id)
+                        if ae:
+                            auth[(ae.type, ae.state_key)] = ae
+
+                    event_infos.append(_NewEventInfo(event, None, auth))
+
+                except Exception as e:
+                    logger.warning(
+                        "Error fetching missing state/auth event %s: %s %s",
+                        event_id,
+                        type(e),
+                        e,
+                    )
+
+        await concurrently_execute(get_event, events, 5)
+
+        await self._handle_new_events(
+            destination, event_infos,
+        )
+
+    def _sanity_check_event(self, ev):
+        """
+        Do some early sanity checks of a received event
+
+        In particular, checks it doesn't have an excessive number of
+        prev_events or auth_events, which could cause a huge state resolution
+        or cascade of event fetches.
+
+        Args:
+            ev (synapse.events.EventBase): event to be checked
+
+        Returns: None
+
+        Raises:
+            SynapseError if the event does not pass muster
+        """
+        if len(ev.prev_event_ids()) > 20:
+            logger.warning(
+                "Rejecting event %s which has %i prev_events",
+                ev.event_id,
+                len(ev.prev_event_ids()),
+            )
+            raise SynapseError(http_client.BAD_REQUEST, "Too many prev_events")
+
+        if len(ev.auth_event_ids()) > 10:
+            logger.warning(
+                "Rejecting event %s which has %i auth_events",
+                ev.event_id,
+                len(ev.auth_event_ids()),
+            )
+            raise SynapseError(http_client.BAD_REQUEST, "Too many auth_events")
+
+    async def send_invite(self, target_host, event):
         """ Sends the invite to the remote server for signing.
 
         Invites must be signed by the invitee's server before distribution.
         """
-        pdu = yield self.replication_layer.send_invite(
+        pdu = await self.federation_client.send_invite(
             destination=target_host,
             room_id=event.room_id,
             event_id=event.event_id,
-            pdu=event
+            pdu=event,
         )
 
-        defer.returnValue(pdu)
+        return pdu
 
-    @defer.inlineCallbacks
-    def on_event_auth(self, event_id):
-        event = yield self.store.get_event(event_id)
-        auth = yield self.store.get_auth_chain(
-            [auth_id for auth_id, _ in event.auth_events],
-            include_given=True
+    async def on_event_auth(self, event_id: str) -> List[EventBase]:
+        event = await self.store.get_event(event_id)
+        auth = await self.store.get_auth_chain(
+            list(event.auth_event_ids()), include_given=True
         )
+        return list(auth)
 
-        for event in auth:
-            event.signatures.update(
-                compute_event_signature(
-                    event,
-                    self.hs.hostname,
-                    self.hs.config.signing_key[0]
-                )
-            )
-
-        defer.returnValue([e for e in auth])
-
-    @log_function
-    @defer.inlineCallbacks
-    def do_invite_join(self, target_hosts, room_id, joinee, content):
+    async def do_invite_join(
+        self, target_hosts: Iterable[str], room_id: str, joinee: str, content: JsonDict
+    ) -> None:
         """ Attempts to join the `joinee` to the room `room_id` via the
-        server `target_host`.
+        servers contained in `target_hosts`.
 
         This first triggers a /make_join/ request that returns a partial
         event that we can fill out and sign. This is then sent to the
@@ -864,30 +1246,39 @@ class FederationHandler(BaseHandler):
 
         We suspend processing of any received events from this room until we
         have finished processing the join.
+
+        Args:
+            target_hosts: List of servers to attempt to join the room with.
+
+            room_id: The ID of the room to join.
+
+            joinee: The User ID of the joining user.
+
+            content: The event content to use for the join event.
         """
         logger.debug("Joining %s to %s", joinee, room_id)
 
-        origin, event = yield self._make_and_verify_event(
+        origin, event, room_version_obj = await self._make_and_verify_event(
             target_hosts,
             room_id,
             joinee,
             "join",
             content,
+            params={"ver": KNOWN_ROOM_VERSIONS},
         )
 
         # This shouldn't happen, because the RoomMemberHandler has a
         # linearizer lock which only allows one operation per user per room
         # at a time - so this is just paranoia.
-        assert (room_id not in self.room_queues)
+        assert room_id not in self.room_queues
 
         self.room_queues[room_id] = []
 
-        yield self.store.clean_room_for_join(room_id)
+        await self._clean_room_for_join(room_id)
 
         handled_events = set()
 
         try:
-            event = self._sign_event(event)
             # Try the host we successfully got a response to /make_join/
             # request first.
             try:
@@ -895,7 +1286,10 @@ class FederationHandler(BaseHandler):
                 target_hosts.insert(0, origin)
             except ValueError:
                 pass
-            ret = yield self.replication_layer.send_join(target_hosts, event)
+
+            ret = await self.federation_client.send_join(
+                target_hosts, event, room_version_obj
+            )
 
             origin = ret["origin"]
             state = ret["state"]
@@ -911,23 +1305,37 @@ class FederationHandler(BaseHandler):
 
             logger.debug("do_invite_join event: %s", event)
 
-            try:
-                yield self.store.store_room(
-                    room_id=room_id,
-                    room_creator_user_id="",
-                    is_public=False
-                )
-            except:
-                # FIXME
-                pass
-
-            event_stream_id, max_stream_id = yield self._persist_auth_tree(
-                origin, auth_chain, state, event
+            # if this is the first time we've joined this room, it's time to add
+            # a row to `rooms` with the correct room version. If there's already a
+            # row there, we should override it, since it may have been populated
+            # based on an invite request which lied about the room version.
+            #
+            # federation_client.send_join has already checked that the room
+            # version in the received create event is the same as room_version_obj,
+            # so we can rely on it now.
+            #
+            await self.store.upsert_room_on_join(
+                room_id=room_id, room_version=room_version_obj,
             )
 
-            self.notifier.on_new_room_event(
-                event, event_stream_id, max_stream_id,
-                extra_users=[joinee]
+            await self._persist_auth_tree(
+                origin, auth_chain, state, event, room_version_obj
+            )
+
+            # Check whether this room is the result of an upgrade of a room we already know
+            # about. If so, migrate over user information
+            predecessor = await self.store.get_room_predecessor(room_id)
+            if not predecessor or not isinstance(predecessor.get("room_id"), str):
+                return
+            old_room_id = predecessor["room_id"]
+            logger.debug(
+                "Found predecessor for %s during remote join: %s", room_id, old_room_id
+            )
+
+            # We retrieve the room member handler here as to not cause a cyclic dependency
+            member_handler = self.hs.get_room_member_handler()
+            await member_handler.transfer_room_state_on_room_upgrade(
+                old_room_id, room_id
             )
 
             logger.debug("Finished joining %s to %s", joinee, room_id)
@@ -941,14 +1349,9 @@ class FederationHandler(BaseHandler):
             # lots of requests for missing prev_events which we do actually
             # have. Hence we fire off the deferred, but don't wait for it.
 
-            synapse.util.logcontext.preserve_fn(self._handle_queued_pdus)(
-                room_queue
-            )
+            run_in_background(self._handle_queued_pdus, room_queue)
 
-        defer.returnValue(True)
-
-    @defer.inlineCallbacks
-    def _handle_queued_pdus(self, room_queue):
+    async def _handle_queued_pdus(self, room_queue):
         """Process PDUs which got queued up while we were busy send_joining.
 
         Args:
@@ -957,59 +1360,99 @@ class FederationHandler(BaseHandler):
         """
         for p, origin in room_queue:
             try:
-                logger.info("Processing queued PDU %s which was received "
-                            "while we were joining %s", p.event_id, p.room_id)
-                yield self.on_receive_pdu(origin, p)
+                logger.info(
+                    "Processing queued PDU %s which was received "
+                    "while we were joining %s",
+                    p.event_id,
+                    p.room_id,
+                )
+                with nested_logging_context(p.event_id):
+                    await self.on_receive_pdu(origin, p, sent_to_us_directly=True)
             except Exception as e:
-                logger.warn(
-                    "Error handling queued PDU %s from %s: %s",
-                    p.event_id, origin, e)
+                logger.warning(
+                    "Error handling queued PDU %s from %s: %s", p.event_id, origin, e
+                )
 
-    @defer.inlineCallbacks
-    @log_function
-    def on_make_join_request(self, room_id, user_id):
+    async def on_make_join_request(
+        self, origin: str, room_id: str, user_id: str
+    ) -> EventBase:
         """ We've received a /make_join/ request, so we create a partial
         join event for the room and return that. We do *not* persist or
         process it until the other server has signed it and sent it back.
+
+        Args:
+            origin: The (verified) server name of the requesting server.
+            room_id: Room to create join event in
+            user_id: The user to create the join for
         """
+        if get_domain_from_id(user_id) != origin:
+            logger.info(
+                "Got /make_join request for user %r from different origin %s, ignoring",
+                user_id,
+                origin,
+            )
+            raise SynapseError(403, "User not from origin", Codes.FORBIDDEN)
+
         event_content = {"membership": Membership.JOIN}
 
-        builder = self.event_builder_factory.new({
-            "type": EventTypes.Member,
-            "content": event_content,
-            "room_id": room_id,
-            "sender": user_id,
-            "state_key": user_id,
-        })
+        room_version = await self.store.get_room_version_id(room_id)
+
+        builder = self.event_builder_factory.new(
+            room_version,
+            {
+                "type": EventTypes.Member,
+                "content": event_content,
+                "room_id": room_id,
+                "sender": user_id,
+                "state_key": user_id,
+            },
+        )
 
         try:
-            message_handler = self.hs.get_handlers().message_handler
-            event, context = yield message_handler._create_new_client_event(
-                builder=builder,
+            event, context = await self.event_creation_handler.create_new_client_event(
+                builder=builder
             )
         except AuthError as e:
-            logger.warn("Failed to create join %r because %s", event, e)
+            logger.warning("Failed to create join to %s because %s", room_id, e)
             raise e
+
+        event_allowed = await self.third_party_event_rules.check_event_allowed(
+            event, context
+        )
+        if not event_allowed:
+            logger.info("Creation of join %s forbidden by third-party rules", event)
+            raise SynapseError(
+                403, "This event is not allowed in this context", Codes.FORBIDDEN
+            )
 
         # The remote hasn't signed it yet, obviously. We'll do the full checks
         # when we get the event back in `on_send_join_request`
-        yield self.auth.check_from_context(event, context, do_sig_check=False)
+        await self.auth.check_from_context(
+            room_version, event, context, do_sig_check=False
+        )
 
-        defer.returnValue(event)
+        return event
 
-    @defer.inlineCallbacks
-    @log_function
-    def on_send_join_request(self, origin, pdu):
+    async def on_send_join_request(self, origin, pdu):
         """ We have received a join event for a room. Fully process it and
         respond with the current state and auth chains.
         """
         event = pdu
 
         logger.debug(
-            "on_send_join_request: Got event: %s, signatures: %s",
+            "on_send_join_request from %s: Got event: %s, signatures: %s",
+            origin,
             event.event_id,
             event.signatures,
         )
+
+        if get_domain_from_id(event.sender) != origin:
+            logger.info(
+                "Got /send_join request for user %r from different origin %s",
+                event.sender,
+                origin,
+            )
+            raise SynapseError(403, "User not from origin", Codes.FORBIDDEN)
 
         event.internal_metadata.outlier = False
         # Send this event on behalf of the origin server.
@@ -1027,9 +1470,16 @@ class FederationHandler(BaseHandler):
         # would introduce the danger of backwards-compatibility problems.
         event.internal_metadata.send_on_behalf_of = origin
 
-        context, event_stream_id, max_stream_id = yield self._handle_new_event(
-            origin, event
+        context = await self._handle_new_event(origin, event)
+
+        event_allowed = await self.third_party_event_rules.check_event_allowed(
+            event, context
         )
+        if not event_allowed:
+            logger.info("Sending of join %s forbidden by third-party rules", event)
+            raise SynapseError(
+                403, "This event is not allowed in this context", Codes.FORBIDDEN
+            )
 
         logger.debug(
             "on_send_join_request: After _handle_new_event: %s, sigs: %s",
@@ -1037,42 +1487,43 @@ class FederationHandler(BaseHandler):
             event.signatures,
         )
 
-        extra_users = []
-        if event.type == EventTypes.Member:
-            target_user_id = event.state_key
-            target_user = UserID.from_string(target_user_id)
-            extra_users.append(target_user)
-
-        self.notifier.on_new_room_event(
-            event, event_stream_id, max_stream_id, extra_users=extra_users
-        )
-
         if event.type == EventTypes.Member:
             if event.content["membership"] == Membership.JOIN:
                 user = UserID.from_string(event.state_key)
-                yield user_joined_room(self.distributor, user, event.room_id)
+                await self.user_joined_room(user, event.room_id)
 
-        state_ids = context.prev_state_ids.values()
-        auth_chain = yield self.store.get_auth_chain(state_ids)
+        prev_state_ids = await context.get_prev_state_ids()
 
-        state = yield self.store.get_events(context.prev_state_ids.values())
+        state_ids = list(prev_state_ids.values())
+        auth_chain = await self.store.get_auth_chain(state_ids)
 
-        defer.returnValue({
-            "state": state.values(),
-            "auth_chain": auth_chain,
-        })
+        state = await self.store.get_events(list(prev_state_ids.values()))
 
-    @defer.inlineCallbacks
-    def on_invite_request(self, origin, pdu):
+        return {"state": list(state.values()), "auth_chain": auth_chain}
+
+    async def on_invite_request(
+        self, origin: str, event: EventBase, room_version: RoomVersion
+    ):
         """ We've got an invite event. Process and persist it. Sign it.
 
         Respond with the now signed event.
         """
-        event = pdu
+        if event.state_key is None:
+            raise SynapseError(400, "The invite event did not have a state key")
 
-        is_blocked = yield self.store.is_room_blocked(event.room_id)
+        is_blocked = await self.store.is_room_blocked(event.room_id)
         if is_blocked:
             raise SynapseError(403, "This room has been blocked on this server")
+
+        if self.hs.config.block_non_admin_invites:
+            raise SynapseError(403, "This server does not accept room invites")
+
+        if not self.spam_checker.user_may_invite(
+            event.sender, event.state_key, event.room_id
+        ):
+            raise SynapseError(
+                403, "This user is not permitted to send invites to this server/user"
+            )
 
         membership = event.content.get("membership")
         if event.type != EventTypes.Member or membership != Membership.INVITE:
@@ -1080,52 +1531,51 @@ class FederationHandler(BaseHandler):
 
         sender_domain = get_domain_from_id(event.sender)
         if sender_domain != origin:
-            raise SynapseError(400, "The invite event was not from the server sending it")
-
-        if event.state_key is None:
-            raise SynapseError(400, "The invite event did not have a state key")
+            raise SynapseError(
+                400, "The invite event was not from the server sending it"
+            )
 
         if not self.is_mine_id(event.state_key):
             raise SynapseError(400, "The invite event must be for this server")
 
+        # block any attempts to invite the server notices mxid
+        if event.state_key == self._server_notices_mxid:
+            raise SynapseError(http_client.FORBIDDEN, "Cannot invite this user")
+
+        # keep a record of the room version, if we don't yet know it.
+        # (this may get overwritten if we later get a different room version in a
+        # join dance).
+        await self._maybe_store_room_on_invite(
+            room_id=event.room_id, room_version=room_version
+        )
+
         event.internal_metadata.outlier = True
-        event.internal_metadata.invite_from_remote = True
+        event.internal_metadata.out_of_band_membership = True
 
         event.signatures.update(
             compute_event_signature(
-                event,
+                room_version,
+                event.get_pdu_json(),
                 self.hs.hostname,
-                self.hs.config.signing_key[0]
+                self.hs.config.signing_key[0],
             )
         )
 
-        context = yield self.state_handler.compute_event_context(event)
+        context = await self.state_handler.compute_event_context(event)
+        await self.persist_events_and_notify([(event, context)])
 
-        event_stream_id, max_stream_id = yield self.store.persist_event(
-            event,
-            context=context,
-        )
+        return event
 
-        target_user = UserID.from_string(event.state_key)
-        self.notifier.on_new_room_event(
-            event, event_stream_id, max_stream_id,
-            extra_users=[target_user],
-        )
-
-        defer.returnValue(event)
-
-    @defer.inlineCallbacks
-    def do_remotely_reject_invite(self, target_hosts, room_id, user_id):
-        origin, event = yield self._make_and_verify_event(
-            target_hosts,
-            room_id,
-            user_id,
-            "leave"
+    async def do_remotely_reject_invite(
+        self, target_hosts: Iterable[str], room_id: str, user_id: str, content: JsonDict
+    ) -> EventBase:
+        origin, event, room_version = await self._make_and_verify_event(
+            target_hosts, room_id, user_id, "leave", content=content
         )
         # Mark as outlier as we don't have any state for this event; we're not
         # even in the room.
         event.internal_metadata.outlier = True
-        event = self._sign_event(event)
+        event.internal_metadata.out_of_band_membership = True
 
         # Try the host that we succesfully called /make_leave/ on first for
         # the /send_leave/ request.
@@ -1135,103 +1585,98 @@ class FederationHandler(BaseHandler):
         except ValueError:
             pass
 
-        yield self.replication_layer.send_leave(
-            target_hosts,
-            event
-        )
+        await self.federation_client.send_leave(target_hosts, event)
 
-        context = yield self.state_handler.compute_event_context(event)
+        context = await self.state_handler.compute_event_context(event)
+        await self.persist_events_and_notify([(event, context)])
 
-        event_stream_id, max_stream_id = yield self.store.persist_event(
+        return event
+
+    async def _make_and_verify_event(
+        self,
+        target_hosts: Iterable[str],
+        room_id: str,
+        user_id: str,
+        membership: str,
+        content: JsonDict = {},
+        params: Optional[Dict[str, str]] = None,
+    ) -> Tuple[str, EventBase, RoomVersion]:
+        (
+            origin,
             event,
-            context=context,
+            room_version,
+        ) = await self.federation_client.make_membership_event(
+            target_hosts, room_id, user_id, membership, content, params=params
         )
 
-        target_user = UserID.from_string(event.state_key)
-        self.notifier.on_new_room_event(
-            event, event_stream_id, max_stream_id,
-            extra_users=[target_user],
-        )
-
-        defer.returnValue(event)
-
-    @defer.inlineCallbacks
-    def _make_and_verify_event(self, target_hosts, room_id, user_id, membership,
-                               content={},):
-        origin, pdu = yield self.replication_layer.make_membership_event(
-            target_hosts,
-            room_id,
-            user_id,
-            membership,
-            content,
-        )
-
-        logger.debug("Got response to make_%s: %s", membership, pdu)
-
-        event = pdu
+        logger.debug("Got response to make_%s: %s", membership, event)
 
         # We should assert some things.
         # FIXME: Do this in a nicer way
-        assert(event.type == EventTypes.Member)
-        assert(event.user_id == user_id)
-        assert(event.state_key == user_id)
-        assert(event.room_id == room_id)
-        defer.returnValue((origin, event))
+        assert event.type == EventTypes.Member
+        assert event.user_id == user_id
+        assert event.state_key == user_id
+        assert event.room_id == room_id
+        return origin, event, room_version
 
-    def _sign_event(self, event):
-        event.internal_metadata.outlier = False
-
-        builder = self.event_builder_factory.new(
-            unfreeze(event.get_pdu_json())
-        )
-
-        builder.event_id = self.event_builder_factory.create_event_id()
-        builder.origin = self.hs.hostname
-
-        if not hasattr(event, "signatures"):
-            builder.signatures = {}
-
-        add_hashes_and_signatures(
-            builder,
-            self.hs.hostname,
-            self.hs.config.signing_key[0],
-        )
-
-        return builder.build()
-
-    @defer.inlineCallbacks
-    @log_function
-    def on_make_leave_request(self, room_id, user_id):
+    async def on_make_leave_request(
+        self, origin: str, room_id: str, user_id: str
+    ) -> EventBase:
         """ We've received a /make_leave/ request, so we create a partial
-        join event for the room and return that. We do *not* persist or
+        leave event for the room and return that. We do *not* persist or
         process it until the other server has signed it and sent it back.
-        """
-        builder = self.event_builder_factory.new({
-            "type": EventTypes.Member,
-            "content": {"membership": Membership.LEAVE},
-            "room_id": room_id,
-            "sender": user_id,
-            "state_key": user_id,
-        })
 
-        message_handler = self.hs.get_handlers().message_handler
-        event, context = yield message_handler._create_new_client_event(
-            builder=builder,
+        Args:
+            origin: The (verified) server name of the requesting server.
+            room_id: Room to create leave event in
+            user_id: The user to create the leave for
+        """
+        if get_domain_from_id(user_id) != origin:
+            logger.info(
+                "Got /make_leave request for user %r from different origin %s, ignoring",
+                user_id,
+                origin,
+            )
+            raise SynapseError(403, "User not from origin", Codes.FORBIDDEN)
+
+        room_version = await self.store.get_room_version_id(room_id)
+        builder = self.event_builder_factory.new(
+            room_version,
+            {
+                "type": EventTypes.Member,
+                "content": {"membership": Membership.LEAVE},
+                "room_id": room_id,
+                "sender": user_id,
+                "state_key": user_id,
+            },
         )
+
+        event, context = await self.event_creation_handler.create_new_client_event(
+            builder=builder
+        )
+
+        event_allowed = await self.third_party_event_rules.check_event_allowed(
+            event, context
+        )
+        if not event_allowed:
+            logger.warning("Creation of leave %s forbidden by third-party rules", event)
+            raise SynapseError(
+                403, "This event is not allowed in this context", Codes.FORBIDDEN
+            )
 
         try:
             # The remote hasn't signed it yet, obviously. We'll do the full checks
             # when we get the event back in `on_send_leave_request`
-            yield self.auth.check_from_context(event, context, do_sig_check=False)
+            await self.auth.check_from_context(
+                room_version, event, context, do_sig_check=False
+            )
         except AuthError as e:
-            logger.warn("Failed to create new leave %r because %s", event, e)
+            logger.warning("Failed to create new leave %r because %s", event, e)
             raise e
 
-        defer.returnValue(event)
+        return event
 
-    @defer.inlineCallbacks
-    @log_function
-    def on_send_leave_request(self, origin, pdu):
+    async def on_send_leave_request(self, origin, pdu):
         """ We have received a leave event for a room. Fully process it."""
         event = pdu
 
@@ -1241,11 +1686,26 @@ class FederationHandler(BaseHandler):
             event.signatures,
         )
 
+        if get_domain_from_id(event.sender) != origin:
+            logger.info(
+                "Got /send_leave request for user %r from different origin %s",
+                event.sender,
+                origin,
+            )
+            raise SynapseError(403, "User not from origin", Codes.FORBIDDEN)
+
         event.internal_metadata.outlier = False
 
-        context, event_stream_id, max_stream_id = yield self._handle_new_event(
-            origin, event
+        context = await self._handle_new_event(origin, event)
+
+        event_allowed = await self.third_party_event_rules.check_event_allowed(
+            event, context
         )
+        if not event_allowed:
+            logger.info("Sending of leave %s forbidden by third-party rules", event)
+            raise SynapseError(
+                403, "This event is not allowed in this context", Codes.FORBIDDEN
+            )
 
         logger.debug(
             "on_send_leave_request: After _handle_new_event: %s, sigs: %s",
@@ -1253,36 +1713,24 @@ class FederationHandler(BaseHandler):
             event.signatures,
         )
 
-        extra_users = []
-        if event.type == EventTypes.Member:
-            target_user_id = event.state_key
-            target_user = UserID.from_string(target_user_id)
-            extra_users.append(target_user)
-
-        self.notifier.on_new_room_event(
-            event, event_stream_id, max_stream_id, extra_users=extra_users
-        )
-
-        defer.returnValue(None)
+        return None
 
     @defer.inlineCallbacks
     def get_state_for_pdu(self, room_id, event_id):
         """Returns the state at the event. i.e. not including said event.
         """
-        yield run_on_reactor()
 
-        state_groups = yield self.store.get_state_groups(
-            room_id, [event_id]
+        event = yield self.store.get_event(
+            event_id, allow_none=False, check_room_id=room_id
         )
 
-        if state_groups:
-            _, state = state_groups.items().pop()
-            results = {
-                (e.type, e.state_key): e for e in state
-            }
+        state_groups = yield self.state_store.get_state_groups(room_id, [event_id])
 
-            event = yield self.store.get_event(event_id)
-            if event and event.is_state():
+        if state_groups:
+            _, state = list(iteritems(state_groups)).pop()
+            results = {(e.type, e.state_key): e for e in state}
+
+            if event.is_state():
                 # Get previous state
                 if "replaces_state" in event.unsigned:
                     prev_id = event.unsigned["replaces_state"]
@@ -1292,39 +1740,26 @@ class FederationHandler(BaseHandler):
                 else:
                     del results[(event.type, event.state_key)]
 
-            res = results.values()
-            for event in res:
-                # We sign these again because there was a bug where we
-                # incorrectly signed things the first time round
-                if self.is_mine_id(event.event_id):
-                    event.signatures.update(
-                        compute_event_signature(
-                            event,
-                            self.hs.hostname,
-                            self.hs.config.signing_key[0]
-                        )
-                    )
-
-            defer.returnValue(res)
+            res = list(results.values())
+            return res
         else:
-            defer.returnValue([])
+            return []
 
     @defer.inlineCallbacks
     def get_state_ids_for_pdu(self, room_id, event_id):
         """Returns the state at the event. i.e. not including said event.
         """
-        yield run_on_reactor()
-
-        state_groups = yield self.store.get_state_groups_ids(
-            room_id, [event_id]
+        event = yield self.store.get_event(
+            event_id, allow_none=False, check_room_id=room_id
         )
 
+        state_groups = yield self.state_store.get_state_groups_ids(room_id, [event_id])
+
         if state_groups:
-            _, state = state_groups.items().pop()
+            _, state = list(state_groups.items()).pop()
             results = state
 
-            event = yield self.store.get_event(event_id)
-            if event and event.is_state():
+            if event.is_state():
                 # Get previous state
                 if "replaces_state" in event.unsigned:
                     prev_id = event.unsigned["replaces_state"]
@@ -1333,9 +1768,9 @@ class FederationHandler(BaseHandler):
                 else:
                     results.pop((event.type, event.state_key), None)
 
-            defer.returnValue(results.values())
+            return list(results.values())
         else:
-            defer.returnValue([])
+            return []
 
     @defer.inlineCallbacks
     @log_function
@@ -1344,149 +1779,154 @@ class FederationHandler(BaseHandler):
         if not in_room:
             raise AuthError(403, "Host not in room.")
 
-        events = yield self.store.get_backfill_events(
-            room_id,
-            pdu_list,
-            limit
-        )
+        # Synapse asks for 100 events per backfill request. Do not allow more.
+        limit = min(limit, 100)
 
-        events = yield self._filter_events_for_server(origin, room_id, events)
+        events = yield self.store.get_backfill_events(room_id, pdu_list, limit)
 
-        defer.returnValue(events)
+        events = yield filter_events_for_server(self.storage, origin, events)
+
+        return events
 
     @defer.inlineCallbacks
     @log_function
-    def get_persisted_pdu(self, origin, event_id, do_auth=True):
-        """ Get a PDU from the database with given origin and id.
+    def get_persisted_pdu(self, origin, event_id):
+        """Get an event from the database for the given server.
+
+        Args:
+            origin [str]: hostname of server which is requesting the event; we
+               will check that the server is allowed to see it.
+            event_id [str]: id of the event being requested
 
         Returns:
-            Deferred: Results in a `Pdu`.
+            Deferred[EventBase|None]: None if we know nothing about the event;
+                otherwise the (possibly-redacted) event.
+
+        Raises:
+            AuthError if the server is not currently in the room
         """
         event = yield self.store.get_event(
-            event_id,
-            allow_none=True,
-            allow_rejected=True,
+            event_id, allow_none=True, allow_rejected=True
         )
 
         if event:
-            if self.is_mine_id(event.event_id):
-                # FIXME: This is a temporary work around where we occasionally
-                # return events slightly differently than when they were
-                # originally signed
-                event.signatures.update(
-                    compute_event_signature(
-                        event,
-                        self.hs.hostname,
-                        self.hs.config.signing_key[0]
-                    )
-                )
+            in_room = yield self.auth.check_host_in_room(event.room_id, origin)
+            if not in_room:
+                raise AuthError(403, "Host not in room.")
 
-            if do_auth:
-                in_room = yield self.auth.check_host_in_room(
-                    event.room_id,
-                    origin
-                )
-                if not in_room:
-                    raise AuthError(403, "Host not in room.")
-
-                events = yield self._filter_events_for_server(
-                    origin, event.room_id, [event]
-                )
-
-                event = events[0]
-
-            defer.returnValue(event)
+            events = yield filter_events_for_server(self.storage, origin, [event])
+            event = events[0]
+            return event
         else:
-            defer.returnValue(None)
+            return None
 
-    @log_function
     def get_min_depth_for_context(self, context):
         return self.store.get_min_depth(context)
 
-    @defer.inlineCallbacks
-    @log_function
-    def _handle_new_event(self, origin, event, state=None, auth_events=None,
-                          backfilled=False):
-        context = yield self._prep_event(
-            origin, event,
-            state=state,
-            auth_events=auth_events,
+    async def _handle_new_event(
+        self, origin, event, state=None, auth_events=None, backfilled=False
+    ):
+        context = await self._prep_event(
+            origin, event, state=state, auth_events=auth_events, backfilled=backfilled
         )
 
-        if not event.internal_metadata.is_outlier():
-            yield self.action_generator.handle_push_actions_for_event(
-                event, context
+        # reraise does not allow inlineCallbacks to preserve the stacktrace, so we
+        # hack around with a try/finally instead.
+        success = False
+        try:
+            if (
+                not event.internal_metadata.is_outlier()
+                and not backfilled
+                and not context.rejected
+            ):
+                await self.action_generator.handle_push_actions_for_event(
+                    event, context
+                )
+
+            await self.persist_events_and_notify(
+                [(event, context)], backfilled=backfilled
             )
+            success = True
+        finally:
+            if not success:
+                run_in_background(
+                    self.store.remove_push_actions_from_staging, event.event_id
+                )
 
-        event_stream_id, max_stream_id = yield self.store.persist_event(
-            event,
-            context=context,
-            backfilled=backfilled,
-        )
+        return context
 
-        if not backfilled:
-            # this intentionally does not yield: we don't care about the result
-            # and don't need to wait for it.
-            preserve_fn(self.pusher_pool.on_new_notifications)(
-                event_stream_id, max_stream_id
-            )
-
-        defer.returnValue((context, event_stream_id, max_stream_id))
-
-    @defer.inlineCallbacks
-    def _handle_new_events(self, origin, event_infos, backfilled=False):
+    async def _handle_new_events(
+        self,
+        origin: str,
+        event_infos: Iterable[_NewEventInfo],
+        backfilled: bool = False,
+    ) -> None:
         """Creates the appropriate contexts and persists events. The events
         should not depend on one another, e.g. this should be used to persist
         a bunch of outliers, but not a chunk of individual events that depend
         on each other for state calculations.
-        """
-        contexts = yield preserve_context_over_deferred(defer.gatherResults(
-            [
-                preserve_fn(self._prep_event)(
-                    origin,
-                    ev_info["event"],
-                    state=ev_info.get("state"),
-                    auth_events=ev_info.get("auth_events"),
-                )
-                for ev_info in event_infos
-            ]
-        ))
 
-        yield self.store.persist_events(
+        Notifies about the events where appropriate.
+        """
+
+        async def prep(ev_info: _NewEventInfo):
+            event = ev_info.event
+            with nested_logging_context(suffix=event.event_id):
+                res = await self._prep_event(
+                    origin,
+                    event,
+                    state=ev_info.state,
+                    auth_events=ev_info.auth_events,
+                    backfilled=backfilled,
+                )
+            return res
+
+        contexts = await make_deferred_yieldable(
+            defer.gatherResults(
+                [run_in_background(prep, ev_info) for ev_info in event_infos],
+                consumeErrors=True,
+            )
+        )
+
+        await self.persist_events_and_notify(
             [
-                (ev_info["event"], context)
-                for ev_info, context in itertools.izip(event_infos, contexts)
+                (ev_info.event, context)
+                for ev_info, context in zip(event_infos, contexts)
             ],
             backfilled=backfilled,
         )
 
-    @defer.inlineCallbacks
-    def _persist_auth_tree(self, origin, auth_events, state, event):
+    async def _persist_auth_tree(
+        self,
+        origin: str,
+        auth_events: List[EventBase],
+        state: List[EventBase],
+        event: EventBase,
+        room_version: RoomVersion,
+    ) -> None:
         """Checks the auth chain is valid (and passes auth checks) for the
         state and event. Then persists the auth chain and state atomically.
-        Persists the event seperately.
+        Persists the event separately. Notifies about the persisted events
+        where appropriate.
 
         Will attempt to fetch missing auth events.
 
         Args:
-            origin (str): Where the events came from
-            auth_events (list)
-            state (list)
-            event (Event)
-
-        Returns:
-            2-tuple of (event_stream_id, max_stream_id) from the persist_event
-            call for `event`
+            origin: Where the events came from
+            auth_events
+            state
+            event
+            room_version: The room version we expect this room to have, and
+                will raise if it doesn't match the version in the create event.
         """
         events_to_context = {}
         for e in itertools.chain(auth_events, state):
             e.internal_metadata.outlier = True
-            ctx = yield self.state_handler.compute_event_context(e)
+            ctx = await self.state_handler.compute_event_context(e)
             events_to_context[e.event_id] = ctx
 
         event_map = {
-            e.event_id: e
-            for e in itertools.chain(auth_events, state, [event])
+            e.event_id: e for e in itertools.chain(auth_events, state, [event])
         }
 
         create_event = None
@@ -1495,18 +1935,27 @@ class FederationHandler(BaseHandler):
                 create_event = e
                 break
 
+        if create_event is None:
+            # If the state doesn't have a create event then the room is
+            # invalid, and it would fail auth checks anyway.
+            raise SynapseError(400, "No create event in state")
+
+        room_version_id = create_event.content.get(
+            "room_version", RoomVersions.V1.identifier
+        )
+
+        if room_version.identifier != room_version_id:
+            raise SynapseError(400, "Room version mismatch")
+
         missing_auth_events = set()
         for e in itertools.chain(auth_events, state, [event]):
-            for e_id, _ in e.auth_events:
+            for e_id in e.auth_event_ids():
                 if e_id not in event_map:
                     missing_auth_events.add(e_id)
 
         for e_id in missing_auth_events:
-            m_ev = yield self.replication_layer.get_pdu(
-                [origin],
-                e_id,
-                outlier=True,
-                timeout=10000,
+            m_ev = await self.federation_client.get_pdu(
+                [origin], e_id, room_version=room_version, outlier=True, timeout=10000,
             )
             if m_ev and m_ev.event_id == e_id:
                 event_map[e_id] = m_ev
@@ -1516,14 +1965,14 @@ class FederationHandler(BaseHandler):
         for e in itertools.chain(auth_events, state, [event]):
             auth_for_e = {
                 (event_map[e_id].type, event_map[e_id].state_key): event_map[e_id]
-                for e_id, _ in e.auth_events
+                for e_id in e.auth_event_ids()
                 if e_id in event_map
             }
             if create_event:
                 auth_for_e[(EventTypes.Create, "")] = create_event
 
             try:
-                self.auth.check(e, auth_events=auth_for_e)
+                event_auth.check(room_version, e, auth_events=auth_for_e)
             except SynapseError as err:
                 # we may get SynapseErrors here as well as AuthErrors. For
                 # instance, there are a couple of (ancient) events in some
@@ -1531,370 +1980,483 @@ class FederationHandler(BaseHandler):
                 # cause SynapseErrors in auth.check. We don't want to give up
                 # the attempt to federate altogether in such cases.
 
-                logger.warn(
-                    "Rejecting %s because %s",
-                    e.event_id, err.msg
-                )
+                logger.warning("Rejecting %s because %s", e.event_id, err.msg)
 
                 if e == event:
                     raise
                 events_to_context[e.event_id].rejected = RejectedReason.AUTH_ERROR
 
-        yield self.store.persist_events(
+        await self.persist_events_and_notify(
             [
                 (e, events_to_context[e.event_id])
                 for e in itertools.chain(auth_events, state)
-            ],
+            ]
         )
 
-        new_event_context = yield self.state_handler.compute_event_context(
+        new_event_context = await self.state_handler.compute_event_context(
             event, old_state=state
         )
 
-        event_stream_id, max_stream_id = yield self.store.persist_event(
-            event, new_event_context,
-        )
+        await self.persist_events_and_notify([(event, new_event_context)])
 
-        defer.returnValue((event_stream_id, max_stream_id))
-
-    @defer.inlineCallbacks
-    def _prep_event(self, origin, event, state=None, auth_events=None):
-        """
-
-        Args:
-            origin:
-            event:
-            state:
-            auth_events:
-
-        Returns:
-            Deferred, which resolves to synapse.events.snapshot.EventContext
-        """
-        context = yield self.state_handler.compute_event_context(
-            event, old_state=state,
-        )
+    async def _prep_event(
+        self,
+        origin: str,
+        event: EventBase,
+        state: Optional[Iterable[EventBase]],
+        auth_events: Optional[StateMap[EventBase]],
+        backfilled: bool,
+    ) -> EventContext:
+        context = await self.state_handler.compute_event_context(event, old_state=state)
 
         if not auth_events:
-            auth_events_ids = yield self.auth.compute_auth_events(
-                event, context.prev_state_ids, for_verification=True,
+            prev_state_ids = await context.get_prev_state_ids()
+            auth_events_ids = await self.auth.compute_auth_events(
+                event, prev_state_ids, for_verification=True
             )
-            auth_events = yield self.store.get_events(auth_events_ids)
-            auth_events = {
-                (e.type, e.state_key): e for e in auth_events.values()
-            }
+            auth_events = await self.store.get_events(auth_events_ids)
+            auth_events = {(e.type, e.state_key): e for e in auth_events.values()}
 
         # This is a hack to fix some old rooms where the initial join event
         # didn't reference the create event in its auth events.
-        if event.type == EventTypes.Member and not event.auth_events:
-            if len(event.prev_events) == 1 and event.depth < 5:
-                c = yield self.store.get_event(
-                    event.prev_events[0][0],
-                    allow_none=True,
+        if event.type == EventTypes.Member and not event.auth_event_ids():
+            if len(event.prev_event_ids()) == 1 and event.depth < 5:
+                c = await self.store.get_event(
+                    event.prev_event_ids()[0], allow_none=True
                 )
                 if c and c.type == EventTypes.Create:
                     auth_events[(c.type, c.state_key)] = c
 
-        try:
-            yield self.do_auth(
-                origin, event, context, auth_events=auth_events
+        context = await self.do_auth(origin, event, context, auth_events=auth_events)
+
+        if not context.rejected:
+            await self._check_for_soft_fail(event, state, backfilled)
+
+        if event.type == EventTypes.GuestAccess and not context.rejected:
+            await self.maybe_kick_guest_users(event)
+
+        return context
+
+    async def _check_for_soft_fail(
+        self, event: EventBase, state: Optional[Iterable[EventBase]], backfilled: bool
+    ) -> None:
+        """Checks if we should soft fail the event; if so, marks the event as
+        such.
+
+        Args:
+            event
+            state: The state at the event if we don't have all the event's prev events
+            backfilled: Whether the event is from backfill
+        """
+        # For new (non-backfilled and non-outlier) events we check if the event
+        # passes auth based on the current state. If it doesn't then we
+        # "soft-fail" the event.
+        do_soft_fail_check = not backfilled and not event.internal_metadata.is_outlier()
+        if do_soft_fail_check:
+            extrem_ids = await self.store.get_latest_event_ids_in_room(event.room_id)
+
+            extrem_ids = set(extrem_ids)
+            prev_event_ids = set(event.prev_event_ids())
+
+            if extrem_ids == prev_event_ids:
+                # If they're the same then the current state is the same as the
+                # state at the event, so no point rechecking auth for soft fail.
+                do_soft_fail_check = False
+
+        if do_soft_fail_check:
+            room_version = await self.store.get_room_version_id(event.room_id)
+            room_version_obj = KNOWN_ROOM_VERSIONS[room_version]
+
+            # Calculate the "current state".
+            if state is not None:
+                # If we're explicitly given the state then we won't have all the
+                # prev events, and so we have a gap in the graph. In this case
+                # we want to be a little careful as we might have been down for
+                # a while and have an incorrect view of the current state,
+                # however we still want to do checks as gaps are easy to
+                # maliciously manufacture.
+                #
+                # So we use a "current state" that is actually a state
+                # resolution across the current forward extremities and the
+                # given state at the event. This should correctly handle cases
+                # like bans, especially with state res v2.
+
+                state_sets = await self.state_store.get_state_groups(
+                    event.room_id, extrem_ids
+                )
+                state_sets = list(state_sets.values())
+                state_sets.append(state)
+                current_state_ids = await self.state_handler.resolve_events(
+                    room_version, state_sets, event
+                )
+                current_state_ids = {
+                    k: e.event_id for k, e in iteritems(current_state_ids)
+                }
+            else:
+                current_state_ids = await self.state_handler.get_current_state_ids(
+                    event.room_id, latest_event_ids=extrem_ids
+                )
+
+            logger.debug(
+                "Doing soft-fail check for %s: state %s",
+                event.event_id,
+                current_state_ids,
             )
-        except AuthError as e:
-            logger.warn(
-                "Rejecting %s because %s",
-                event.event_id, e.msg
-            )
 
-            context.rejected = RejectedReason.AUTH_ERROR
+            # Now check if event pass auth against said current state
+            auth_types = auth_types_for_event(event)
+            current_state_ids = [
+                e for k, e in iteritems(current_state_ids) if k in auth_types
+            ]
 
-        if event.type == EventTypes.GuestAccess:
-            yield self.maybe_kick_guest_users(event)
+            current_auth_events = await self.store.get_events(current_state_ids)
+            current_auth_events = {
+                (e.type, e.state_key): e for e in current_auth_events.values()
+            }
 
-        defer.returnValue(context)
+            try:
+                event_auth.check(
+                    room_version_obj, event, auth_events=current_auth_events
+                )
+            except AuthError as e:
+                logger.warning("Soft-failing %r because %s", event, e)
+                event.internal_metadata.soft_failed = True
 
-    @defer.inlineCallbacks
-    def on_query_auth(self, origin, event_id, remote_auth_chain, rejects,
-                      missing):
+    async def on_query_auth(
+        self, origin, event_id, room_id, remote_auth_chain, rejects, missing
+    ):
+        in_room = await self.auth.check_host_in_room(room_id, origin)
+        if not in_room:
+            raise AuthError(403, "Host not in room.")
+
+        event = await self.store.get_event(
+            event_id, allow_none=False, check_room_id=room_id
+        )
+
         # Just go through and process each event in `remote_auth_chain`. We
         # don't want to fall into the trap of `missing` being wrong.
         for e in remote_auth_chain:
             try:
-                yield self._handle_new_event(origin, e)
+                await self._handle_new_event(origin, e)
             except AuthError:
                 pass
 
         # Now get the current auth_chain for the event.
-        event = yield self.store.get_event(event_id)
-        local_auth_chain = yield self.store.get_auth_chain(
-            [auth_id for auth_id, _ in event.auth_events],
-            include_given=True
+        local_auth_chain = await self.store.get_auth_chain(
+            list(event.auth_event_ids()), include_given=True
         )
 
         # TODO: Check if we would now reject event_id. If so we need to tell
         # everyone.
 
-        ret = yield self.construct_auth_difference(
-            local_auth_chain, remote_auth_chain
-        )
-
-        for event in ret["auth_chain"]:
-            event.signatures.update(
-                compute_event_signature(
-                    event,
-                    self.hs.hostname,
-                    self.hs.config.signing_key[0]
-                )
-            )
+        ret = await self.construct_auth_difference(local_auth_chain, remote_auth_chain)
 
         logger.debug("on_query_auth returning: %s", ret)
 
-        defer.returnValue(ret)
+        return ret
 
-    @defer.inlineCallbacks
-    def on_get_missing_events(self, origin, room_id, earliest_events,
-                              latest_events, limit, min_depth):
-        in_room = yield self.auth.check_host_in_room(
-            room_id,
-            origin
-        )
+    async def on_get_missing_events(
+        self, origin, room_id, earliest_events, latest_events, limit
+    ):
+        in_room = await self.auth.check_host_in_room(room_id, origin)
         if not in_room:
             raise AuthError(403, "Host not in room.")
 
+        # Only allow up to 20 events to be retrieved per request.
         limit = min(limit, 20)
-        min_depth = max(min_depth, 0)
 
-        missing_events = yield self.store.get_missing_events(
+        missing_events = await self.store.get_missing_events(
             room_id=room_id,
             earliest_events=earliest_events,
             latest_events=latest_events,
             limit=limit,
-            min_depth=min_depth,
         )
 
-        defer.returnValue(missing_events)
+        missing_events = await filter_events_for_server(
+            self.storage, origin, missing_events
+        )
 
-    @defer.inlineCallbacks
-    @log_function
-    def do_auth(self, origin, event, context, auth_events):
-        # Check if we have all the auth events.
-        current_state = set(e.event_id for e in auth_events.values())
-        event_auth_events = set(e_id for e_id, _ in event.auth_events)
+        return missing_events
 
-        if event.is_state():
-            event_key = (event.type, event.state_key)
-        else:
-            event_key = None
+    async def do_auth(
+        self,
+        origin: str,
+        event: EventBase,
+        context: EventContext,
+        auth_events: StateMap[EventBase],
+    ) -> EventContext:
+        """
 
-        if event_auth_events - current_state:
-            have_events = yield self.store.have_events(
-                event_auth_events - current_state
+        Args:
+            origin:
+            event:
+            context:
+            auth_events:
+                Map from (event_type, state_key) to event
+
+                Normally, our calculated auth_events based on the state of the room
+                at the event's position in the DAG, though occasionally (eg if the
+                event is an outlier), may be the auth events claimed by the remote
+                server.
+
+                Also NB that this function adds entries to it.
+        Returns:
+            updated context object
+        """
+        room_version = await self.store.get_room_version_id(event.room_id)
+        room_version_obj = KNOWN_ROOM_VERSIONS[room_version]
+
+        try:
+            context = await self._update_auth_events_and_context_for_auth(
+                origin, event, context, auth_events
             )
-        else:
-            have_events = {}
+        except Exception:
+            # We don't really mind if the above fails, so lets not fail
+            # processing if it does. However, it really shouldn't fail so
+            # let's still log as an exception since we'll still want to fix
+            # any bugs.
+            logger.exception(
+                "Failed to double check auth events for %s with remote. "
+                "Ignoring failure and continuing processing of event.",
+                event.event_id,
+            )
 
-        have_events.update({
-            e.event_id: ""
-            for e in auth_events.values()
-        })
+        try:
+            event_auth.check(room_version_obj, event, auth_events=auth_events)
+        except AuthError as e:
+            logger.warning("Failed auth resolution for %r because %s", event, e)
+            context.rejected = RejectedReason.AUTH_ERROR
 
-        seen_events = set(have_events.keys())
+        return context
 
-        missing_auth = event_auth_events - seen_events - current_state
+    async def _update_auth_events_and_context_for_auth(
+        self,
+        origin: str,
+        event: EventBase,
+        context: EventContext,
+        auth_events: StateMap[EventBase],
+    ) -> EventContext:
+        """Helper for do_auth. See there for docs.
+
+        Checks whether a given event has the expected auth events. If it
+        doesn't then we talk to the remote server to compare state to see if
+        we can come to a consensus (e.g. if one server missed some valid
+        state).
+
+        This attempts to resolve any potential divergence of state between
+        servers, but is not essential and so failures should not block further
+        processing of the event.
+
+        Args:
+            origin:
+            event:
+            context:
+
+            auth_events:
+                Map from (event_type, state_key) to event
+
+                Normally, our calculated auth_events based on the state of the room
+                at the event's position in the DAG, though occasionally (eg if the
+                event is an outlier), may be the auth events claimed by the remote
+                server.
+
+                Also NB that this function adds entries to it.
+
+        Returns:
+            updated context
+        """
+        event_auth_events = set(event.auth_event_ids())
+
+        # missing_auth is the set of the event's auth_events which we don't yet have
+        # in auth_events.
+        missing_auth = event_auth_events.difference(
+            e.event_id for e in auth_events.values()
+        )
+
+        # if we have missing events, we need to fetch those events from somewhere.
+        #
+        # we start by checking if they are in the store, and then try calling /event_auth/.
+        if missing_auth:
+            have_events = await self.store.have_seen_events(missing_auth)
+            logger.debug("Events %s are in the store", have_events)
+            missing_auth.difference_update(have_events)
 
         if missing_auth:
-            logger.info("Missing auth: %s", missing_auth)
             # If we don't have all the auth events, we need to get them.
+            logger.info("auth_events contains unknown events: %s", missing_auth)
             try:
-                remote_auth_chain = yield self.replication_layer.get_event_auth(
-                    origin, event.room_id, event.event_id
-                )
+                try:
+                    remote_auth_chain = await self.federation_client.get_event_auth(
+                        origin, event.room_id, event.event_id
+                    )
+                except RequestSendFailed as e:
+                    # The other side isn't around or doesn't implement the
+                    # endpoint, so lets just bail out.
+                    logger.info("Failed to get event auth from remote: %s", e)
+                    return context
 
-                seen_remotes = yield self.store.have_events(
+                seen_remotes = await self.store.have_seen_events(
                     [e.event_id for e in remote_auth_chain]
                 )
 
                 for e in remote_auth_chain:
-                    if e.event_id in seen_remotes.keys():
+                    if e.event_id in seen_remotes:
                         continue
 
                     if e.event_id == event.event_id:
                         continue
 
                     try:
-                        auth_ids = [e_id for e_id, _ in e.auth_events]
+                        auth_ids = e.auth_event_ids()
                         auth = {
-                            (e.type, e.state_key): e for e in remote_auth_chain
+                            (e.type, e.state_key): e
+                            for e in remote_auth_chain
                             if e.event_id in auth_ids or e.type == EventTypes.Create
                         }
                         e.internal_metadata.outlier = True
 
                         logger.debug(
-                            "do_auth %s missing_auth: %s",
-                            event.event_id, e.event_id
+                            "do_auth %s missing_auth: %s", event.event_id, e.event_id
                         )
-                        yield self._handle_new_event(
-                            origin, e, auth_events=auth
-                        )
+                        await self._handle_new_event(origin, e, auth_events=auth)
 
                         if e.event_id in event_auth_events:
                             auth_events[(e.type, e.state_key)] = e
                     except AuthError:
                         pass
 
-                have_events = yield self.store.have_events(
-                    [e_id for e_id, _ in event.auth_events]
-                )
-                seen_events = set(have_events.keys())
-            except:
-                # FIXME:
+            except Exception:
                 logger.exception("Failed to get auth chain")
 
-        # FIXME: Assumes we have and stored all the state for all the
-        # prev_events
-        current_state = set(e.event_id for e in auth_events.values())
-        different_auth = event_auth_events - current_state
+        if event.internal_metadata.is_outlier():
+            # XXX: given that, for an outlier, we'll be working with the
+            # event's *claimed* auth events rather than those we calculated:
+            # (a) is there any point in this test, since different_auth below will
+            # obviously be empty
+            # (b) alternatively, why don't we do it earlier?
+            logger.info("Skipping auth_event fetch for outlier")
+            return context
 
-        if different_auth and not event.internal_metadata.is_outlier():
-            # Do auth conflict res.
-            logger.info("Different auth: %s", different_auth)
+        different_auth = event_auth_events.difference(
+            e.event_id for e in auth_events.values()
+        )
 
-            different_events = yield preserve_context_over_deferred(defer.gatherResults(
-                [
-                    preserve_fn(self.store.get_event)(
-                        d,
-                        allow_none=True,
-                        allow_rejected=False,
-                    )
-                    for d in different_auth
-                    if d in have_events and not have_events[d]
-                ],
-                consumeErrors=True
-            )).addErrback(unwrapFirstError)
+        if not different_auth:
+            return context
 
-            if different_events:
-                local_view = dict(auth_events)
-                remote_view = dict(auth_events)
-                remote_view.update({
-                    (d.type, d.state_key): d for d in different_events if d
-                })
+        logger.info(
+            "auth_events refers to events which are not in our calculated auth "
+            "chain: %s",
+            different_auth,
+        )
 
-                new_state = self.state_handler.resolve_events(
-                    [local_view.values(), remote_view.values()],
-                    event
+        # XXX: currently this checks for redactions but I'm not convinced that is
+        # necessary?
+        different_events = await self.store.get_events_as_list(different_auth)
+
+        for d in different_events:
+            if d.room_id != event.room_id:
+                logger.warning(
+                    "Event %s refers to auth_event %s which is in a different room",
+                    event.event_id,
+                    d.event_id,
                 )
 
-                auth_events.update(new_state)
+                # don't attempt to resolve the claimed auth events against our own
+                # in this case: just use our own auth events.
+                #
+                # XXX: should we reject the event in this case? It feels like we should,
+                # but then shouldn't we also do so if we've failed to fetch any of the
+                # auth events?
+                return context
 
-                current_state = set(e.event_id for e in auth_events.values())
-                different_auth = event_auth_events - current_state
+        # now we state-resolve between our own idea of the auth events, and the remote's
+        # idea of them.
 
-                context.current_state_ids = dict(context.current_state_ids)
-                context.current_state_ids.update({
-                    k: a.event_id for k, a in auth_events.items()
-                    if k != event_key
-                })
-                context.prev_state_ids = dict(context.prev_state_ids)
-                context.prev_state_ids.update({
-                    k: a.event_id for k, a in auth_events.items()
-                })
-                context.state_group = self.store.get_next_state_group()
+        local_state = auth_events.values()
+        remote_auth_events = dict(auth_events)
+        remote_auth_events.update({(d.type, d.state_key): d for d in different_events})
+        remote_state = remote_auth_events.values()
 
-        if different_auth and not event.internal_metadata.is_outlier():
-            logger.info("Different auth after resolution: %s", different_auth)
+        room_version = await self.store.get_room_version_id(event.room_id)
+        new_state = await self.state_handler.resolve_events(
+            room_version, (local_state, remote_state), event
+        )
 
-            # Only do auth resolution if we have something new to say.
-            # We can't rove an auth failure.
-            do_resolution = False
+        logger.info(
+            "After state res: updating auth_events with new state %s",
+            {
+                (d.type, d.state_key): d.event_id
+                for d in new_state.values()
+                if auth_events.get((d.type, d.state_key)) != d
+            },
+        )
 
-            provable = [
-                RejectedReason.NOT_ANCESTOR, RejectedReason.NOT_ANCESTOR,
-            ]
+        auth_events.update(new_state)
 
-            for e_id in different_auth:
-                if e_id in have_events:
-                    if have_events[e_id] in provable:
-                        do_resolution = True
-                        break
+        context = await self._update_context_for_auth_events(
+            event, context, auth_events
+        )
 
-            if do_resolution:
-                # 1. Get what we think is the auth chain.
-                auth_ids = yield self.auth.compute_auth_events(
-                    event, context.prev_state_ids
-                )
-                local_auth_chain = yield self.store.get_auth_chain(
-                    auth_ids, include_given=True
-                )
+        return context
 
-                try:
-                    # 2. Get remote difference.
-                    result = yield self.replication_layer.query_auth(
-                        origin,
-                        event.room_id,
-                        event.event_id,
-                        local_auth_chain,
-                    )
+    async def _update_context_for_auth_events(
+        self, event: EventBase, context: EventContext, auth_events: StateMap[EventBase]
+    ) -> EventContext:
+        """Update the state_ids in an event context after auth event resolution,
+        storing the changes as a new state group.
 
-                    seen_remotes = yield self.store.have_events(
-                        [e.event_id for e in result["auth_chain"]]
-                    )
+        Args:
+            event: The event we're handling the context for
 
-                    # 3. Process any remote auth chain events we haven't seen.
-                    for ev in result["auth_chain"]:
-                        if ev.event_id in seen_remotes.keys():
-                            continue
+            context: initial event context
 
-                        if ev.event_id == event.event_id:
-                            continue
+            auth_events: Events to update in the event context.
 
-                        try:
-                            auth_ids = [e_id for e_id, _ in ev.auth_events]
-                            auth = {
-                                (e.type, e.state_key): e
-                                for e in result["auth_chain"]
-                                if e.event_id in auth_ids
-                                or event.type == EventTypes.Create
-                            }
-                            ev.internal_metadata.outlier = True
+        Returns:
+            new event context
+        """
+        # exclude the state key of the new event from the current_state in the context.
+        if event.is_state():
+            event_key = (event.type, event.state_key)
+        else:
+            event_key = None
+        state_updates = {
+            k: a.event_id for k, a in iteritems(auth_events) if k != event_key
+        }
 
-                            logger.debug(
-                                "do_auth %s different_auth: %s",
-                                event.event_id, e.event_id
-                            )
+        current_state_ids = await context.get_current_state_ids()
+        current_state_ids = dict(current_state_ids)
 
-                            yield self._handle_new_event(
-                                origin, ev, auth_events=auth
-                            )
+        current_state_ids.update(state_updates)
 
-                            if ev.event_id in event_auth_events:
-                                auth_events[(ev.type, ev.state_key)] = ev
-                        except AuthError:
-                            pass
+        prev_state_ids = await context.get_prev_state_ids()
+        prev_state_ids = dict(prev_state_ids)
 
-                except:
-                    # FIXME:
-                    logger.exception("Failed to query auth chain")
+        prev_state_ids.update({k: a.event_id for k, a in iteritems(auth_events)})
 
-                # 4. Look at rejects and their proofs.
-                # TODO.
+        # create a new state group as a delta from the existing one.
+        prev_group = context.state_group
+        state_group = await self.state_store.store_state_group(
+            event.event_id,
+            event.room_id,
+            prev_group=prev_group,
+            delta_ids=state_updates,
+            current_state_ids=current_state_ids,
+        )
 
-                context.current_state_ids = dict(context.current_state_ids)
-                context.current_state_ids.update({
-                    k: a.event_id for k, a in auth_events.items()
-                    if k != event_key
-                })
-                context.prev_state_ids = dict(context.prev_state_ids)
-                context.prev_state_ids.update({
-                    k: a.event_id for k, a in auth_events.items()
-                })
-                context.state_group = self.store.get_next_state_group()
+        return EventContext.with_state(
+            state_group=state_group,
+            state_group_before_event=context.state_group_before_event,
+            current_state_ids=current_state_ids,
+            prev_state_ids=prev_state_ids,
+            prev_group=prev_group,
+            delta_ids=state_updates,
+        )
 
-        try:
-            self.auth.check(event, auth_events=auth_events)
-        except AuthError as e:
-            logger.warn("Failed auth resolution for %r because %s", event, e)
-            raise e
-
-    @defer.inlineCallbacks
-    def construct_auth_difference(self, local_auth, remote_auth):
+    async def construct_auth_difference(
+        self, local_auth: Iterable[EventBase], remote_auth: Iterable[EventBase]
+    ) -> Dict:
         """ Given a local and remote auth chain, find the differences. This
         assumes that we have already processed all events in remote_auth
 
@@ -1935,8 +2497,8 @@ class FederationHandler(BaseHandler):
 
         def get_next(it, opt=None):
             try:
-                return it.next()
-            except:
+                return next(it)
+            except Exception:
                 return opt
 
         current_local = get_next(local_iter)
@@ -1993,7 +2555,7 @@ class FederationHandler(BaseHandler):
         missing_remote_ids = [e.event_id for e in missing_remotes]
         base_remote_rejected = list(missing_remotes)
         for e in missing_remotes:
-            for e_id, _ in e.auth_events:
+            for e_id in e.auth_event_ids():
                 if e_id in missing_remote_ids:
                     try:
                         base_remote_rejected.remove(e)
@@ -2003,7 +2565,7 @@ class FederationHandler(BaseHandler):
         reason_map = {}
 
         for e in base_remote_rejected:
-            reason = yield self.store.get_rejection_reason(e.event_id)
+            reason = await self.store.get_rejection_reason(e.event_id)
             if reason is None:
                 # TODO: e is not in the current state, so we should
                 # construct some proof of that.
@@ -2011,41 +2573,23 @@ class FederationHandler(BaseHandler):
 
             reason_map[e.event_id] = reason
 
-            if reason == RejectedReason.AUTH_ERROR:
-                pass
-            elif reason == RejectedReason.REPLACED:
-                # TODO: Get proof
-                pass
-            elif reason == RejectedReason.NOT_ANCESTOR:
-                # TODO: Get proof.
-                pass
-
         logger.debug("construct_auth_difference returning")
 
-        defer.returnValue({
+        return {
             "auth_chain": local_auth,
             "rejects": {
-                e.event_id: {
-                    "reason": reason_map[e.event_id],
-                    "proof": None,
-                }
+                e.event_id: {"reason": reason_map[e.event_id], "proof": None}
                 for e in base_remote_rejected
             },
             "missing": [e.event_id for e in missing_locals],
-        })
+        }
 
     @defer.inlineCallbacks
     @log_function
     def exchange_third_party_invite(
-            self,
-            sender_user_id,
-            target_user_id,
-            room_id,
-            signed,
+        self, sender_user_id, target_user_id, room_id, signed
     ):
-        third_party_invite = {
-            "signed": signed,
-        }
+        third_party_invite = {"signed": signed}
 
         event_dict = {
             "type": EventTypes.Member,
@@ -2059,90 +2603,145 @@ class FederationHandler(BaseHandler):
         }
 
         if (yield self.auth.check_host_in_room(room_id, self.hs.hostname)):
-            builder = self.event_builder_factory.new(event_dict)
-            EventValidator().validate_new(builder)
-            message_handler = self.hs.get_handlers().message_handler
-            event, context = yield message_handler._create_new_client_event(
+            room_version = yield self.store.get_room_version_id(room_id)
+            builder = self.event_builder_factory.new(room_version, event_dict)
+
+            EventValidator().validate_builder(builder)
+            event, context = yield self.event_creation_handler.create_new_client_event(
                 builder=builder
             )
 
+            event_allowed = yield self.third_party_event_rules.check_event_allowed(
+                event, context
+            )
+            if not event_allowed:
+                logger.info(
+                    "Creation of threepid invite %s forbidden by third-party rules",
+                    event,
+                )
+                raise SynapseError(
+                    403, "This event is not allowed in this context", Codes.FORBIDDEN
+                )
+
             event, context = yield self.add_display_name_to_third_party_invite(
-                event_dict, event, context
+                room_version, event_dict, event, context
             )
 
+            EventValidator().validate_new(event, self.config)
+
+            # We need to tell the transaction queue to send this out, even
+            # though the sender isn't a local user.
+            event.internal_metadata.send_on_behalf_of = self.hs.hostname
+
             try:
-                yield self.auth.check_from_context(event, context)
+                yield self.auth.check_from_context(room_version, event, context)
             except AuthError as e:
-                logger.warn("Denying new third party invite %r because %s", event, e)
+                logger.warning("Denying new third party invite %r because %s", event, e)
                 raise e
 
             yield self._check_signature(event, context)
-            member_handler = self.hs.get_handlers().room_member_handler
+
+            # We retrieve the room member handler here as to not cause a cyclic dependency
+            member_handler = self.hs.get_room_member_handler()
             yield member_handler.send_membership_event(None, event, context)
         else:
-            destinations = set(x.split(":", 1)[-1] for x in (sender_user_id, room_id))
-            yield self.replication_layer.forward_third_party_invite(
-                destinations,
-                room_id,
-                event_dict,
+            destinations = {x.split(":", 1)[-1] for x in (sender_user_id, room_id)}
+            yield self.federation_client.forward_third_party_invite(
+                destinations, room_id, event_dict
             )
 
-    @defer.inlineCallbacks
-    @log_function
-    def on_exchange_third_party_invite_request(self, origin, room_id, event_dict):
-        builder = self.event_builder_factory.new(event_dict)
+    async def on_exchange_third_party_invite_request(
+        self, room_id: str, event_dict: JsonDict
+    ) -> None:
+        """Handle an exchange_third_party_invite request from a remote server
 
-        message_handler = self.hs.get_handlers().message_handler
-        event, context = yield message_handler._create_new_client_event(
-            builder=builder,
+        The remote server will call this when it wants to turn a 3pid invite
+        into a normal m.room.member invite.
+
+        Args:
+            room_id: The ID of the room.
+
+            event_dict (dict[str, Any]): Dictionary containing the event body.
+
+        """
+        room_version = await self.store.get_room_version_id(room_id)
+
+        # NB: event_dict has a particular specced format we might need to fudge
+        # if we change event formats too much.
+        builder = self.event_builder_factory.new(room_version, event_dict)
+
+        event, context = await self.event_creation_handler.create_new_client_event(
+            builder=builder
         )
 
-        event, context = yield self.add_display_name_to_third_party_invite(
-            event_dict, event, context
+        event_allowed = await self.third_party_event_rules.check_event_allowed(
+            event, context
+        )
+        if not event_allowed:
+            logger.warning(
+                "Exchange of threepid invite %s forbidden by third-party rules", event
+            )
+            raise SynapseError(
+                403, "This event is not allowed in this context", Codes.FORBIDDEN
+            )
+
+        event, context = await self.add_display_name_to_third_party_invite(
+            room_version, event_dict, event, context
         )
 
         try:
-            self.auth.check_from_context(event, context)
+            await self.auth.check_from_context(room_version, event, context)
         except AuthError as e:
-            logger.warn("Denying third party invite %r because %s", event, e)
+            logger.warning("Denying third party invite %r because %s", event, e)
             raise e
-        yield self._check_signature(event, context)
+        await self._check_signature(event, context)
 
-        returned_invite = yield self.send_invite(origin, event)
-        # TODO: Make sure the signatures actually are correct.
-        event.signatures.update(returned_invite.signatures)
-        member_handler = self.hs.get_handlers().room_member_handler
-        yield member_handler.send_membership_event(None, event, context)
+        # We need to tell the transaction queue to send this out, even
+        # though the sender isn't a local user.
+        event.internal_metadata.send_on_behalf_of = get_domain_from_id(event.sender)
+
+        # We retrieve the room member handler here as to not cause a cyclic dependency
+        member_handler = self.hs.get_room_member_handler()
+        await member_handler.send_membership_event(None, event, context)
 
     @defer.inlineCallbacks
-    def add_display_name_to_third_party_invite(self, event_dict, event, context):
+    def add_display_name_to_third_party_invite(
+        self, room_version, event_dict, event, context
+    ):
         key = (
             EventTypes.ThirdPartyInvite,
-            event.content["third_party_invite"]["signed"]["token"]
+            event.content["third_party_invite"]["signed"]["token"],
         )
         original_invite = None
-        original_invite_id = context.prev_state_ids.get(key)
+        prev_state_ids = yield context.get_prev_state_ids()
+        original_invite_id = prev_state_ids.get(key)
         if original_invite_id:
             original_invite = yield self.store.get_event(
                 original_invite_id, allow_none=True
             )
         if original_invite:
-            display_name = original_invite.content["display_name"]
+            # If the m.room.third_party_invite event's content is empty, it means the
+            # invite has been revoked. In this case, we don't have to raise an error here
+            # because the auth check will fail on the invite (because it's not able to
+            # fetch public keys from the m.room.third_party_invite event's content, which
+            # is empty).
+            display_name = original_invite.content.get("display_name")
             event_dict["content"]["third_party_invite"]["display_name"] = display_name
         else:
             logger.info(
-                "Could not find invite event for third_party_invite: %r",
-                event_dict
+                "Could not find invite event for third_party_invite: %r", event_dict
             )
             # We don't discard here as this is not the appropriate place to do
             # auth checks. If we need the invite and don't have it then the
             # auth check code will explode appropriately.
 
-        builder = self.event_builder_factory.new(event_dict)
-        EventValidator().validate_new(builder)
-        message_handler = self.hs.get_handlers().message_handler
-        event, context = yield message_handler._create_new_client_event(builder=builder)
-        defer.returnValue((event, context))
+        builder = self.event_builder_factory.new(room_version, event_dict)
+        EventValidator().validate_builder(builder)
+        event, context = yield self.event_creation_handler.create_new_client_event(
+            builder=builder
+        )
+        EventValidator().validate_new(event, self.config)
+        return (event, context)
 
     @defer.inlineCallbacks
     def _check_signature(self, event, context):
@@ -2162,9 +2761,8 @@ class FederationHandler(BaseHandler):
         signed = event.content["third_party_invite"]["signed"]
         token = signed["token"]
 
-        invite_event_id = context.prev_state_ids.get(
-            (EventTypes.ThirdPartyInvite, token,)
-        )
+        prev_state_ids = yield context.get_prev_state_ids()
+        invite_event_id = prev_state_ids.get((EventTypes.ThirdPartyInvite, token))
 
         invite_event = None
         if invite_event_id:
@@ -2173,25 +2771,59 @@ class FederationHandler(BaseHandler):
         if not invite_event:
             raise AuthError(403, "Could not find invite")
 
+        logger.debug("Checking auth on event %r", event.content)
+
         last_exception = None
+        # for each public key in the 3pid invite event
         for public_key_object in self.hs.get_auth().get_public_keys(invite_event):
             try:
+                # for each sig on the third_party_invite block of the actual invite
                 for server, signature_block in signed["signatures"].items():
                     for key_name, encoded_signature in signature_block.items():
                         if not key_name.startswith("ed25519:"):
                             continue
 
-                        public_key = public_key_object["public_key"]
-                        verify_key = decode_verify_key_bytes(
+                        logger.debug(
+                            "Attempting to verify sig with key %s from %r "
+                            "against pubkey %r",
                             key_name,
-                            decode_base64(public_key)
+                            server,
+                            public_key_object,
                         )
-                        verify_signed_json(signed, server, verify_key)
-                        if "key_validity_url" in public_key_object:
-                            yield self._check_key_revocation(
-                                public_key,
-                                public_key_object["key_validity_url"]
+
+                        try:
+                            public_key = public_key_object["public_key"]
+                            verify_key = decode_verify_key_bytes(
+                                key_name, decode_base64(public_key)
                             )
+                            verify_signed_json(signed, server, verify_key)
+                            logger.debug(
+                                "Successfully verified sig with key %s from %r "
+                                "against pubkey %r",
+                                key_name,
+                                server,
+                                public_key_object,
+                            )
+                        except Exception:
+                            logger.info(
+                                "Failed to verify sig with key %s from %r "
+                                "against pubkey %r",
+                                key_name,
+                                server,
+                                public_key_object,
+                            )
+                            raise
+                        try:
+                            if "key_validity_url" in public_key_object:
+                                yield self._check_key_revocation(
+                                    public_key, public_key_object["key_validity_url"]
+                                )
+                        except Exception:
+                            logger.info(
+                                "Failed to query key_validity_url %s",
+                                public_key_object["key_validity_url"],
+                            )
+                            raise
                         return
             except Exception as e:
                 last_exception = e
@@ -2212,14 +2844,122 @@ class FederationHandler(BaseHandler):
                 for revocation.
         """
         try:
-            response = yield self.hs.get_simple_http_client().get_json(
-                url,
-                {"public_key": public_key}
-            )
+            response = yield self.http_client.get_json(url, {"public_key": public_key})
         except Exception:
-            raise SynapseError(
-                502,
-                "Third party certificate could not be checked"
-            )
+            raise SynapseError(502, "Third party certificate could not be checked")
         if "valid" not in response or not response["valid"]:
             raise AuthError(403, "Third party certificate was invalid")
+
+    async def persist_events_and_notify(
+        self,
+        event_and_contexts: Sequence[Tuple[EventBase, EventContext]],
+        backfilled: bool = False,
+    ) -> None:
+        """Persists events and tells the notifier/pushers about them, if
+        necessary.
+
+        Args:
+            event_and_contexts:
+            backfilled: Whether these events are a result of
+                backfilling or not
+        """
+        if self.config.worker_app:
+            await self._send_events_to_master(
+                store=self.store,
+                event_and_contexts=event_and_contexts,
+                backfilled=backfilled,
+            )
+        else:
+            max_stream_id = await self.storage.persistence.persist_events(
+                event_and_contexts, backfilled=backfilled
+            )
+
+            if self._ephemeral_messages_enabled:
+                for (event, context) in event_and_contexts:
+                    # If there's an expiry timestamp on the event, schedule its expiry.
+                    self._message_handler.maybe_schedule_expiry(event)
+
+            if not backfilled:  # Never notify for backfilled events
+                for event, _ in event_and_contexts:
+                    await self._notify_persisted_event(event, max_stream_id)
+
+    async def _notify_persisted_event(
+        self, event: EventBase, max_stream_id: int
+    ) -> None:
+        """Checks to see if notifier/pushers should be notified about the
+        event or not.
+
+        Args:
+            event:
+            max_stream_id: The max_stream_id returned by persist_events
+        """
+
+        extra_users = []
+        if event.type == EventTypes.Member:
+            target_user_id = event.state_key
+
+            # We notify for memberships if its an invite for one of our
+            # users
+            if event.internal_metadata.is_outlier():
+                if event.membership != Membership.INVITE:
+                    if not self.is_mine_id(target_user_id):
+                        return
+
+            target_user = UserID.from_string(target_user_id)
+            extra_users.append(target_user)
+        elif event.internal_metadata.is_outlier():
+            return
+
+        event_stream_id = event.internal_metadata.stream_ordering
+        self.notifier.on_new_room_event(
+            event, event_stream_id, max_stream_id, extra_users=extra_users
+        )
+
+        await self.pusher_pool.on_new_notifications(event_stream_id, max_stream_id)
+
+    async def _clean_room_for_join(self, room_id: str) -> None:
+        """Called to clean up any data in DB for a given room, ready for the
+        server to join the room.
+
+        Args:
+            room_id
+        """
+        if self.config.worker_app:
+            await self._clean_room_for_join_client(room_id)
+        else:
+            await self.store.clean_room_for_join(room_id)
+
+    async def user_joined_room(self, user: UserID, room_id: str) -> None:
+        """Called when a new user has joined the room
+        """
+        if self.config.worker_app:
+            await self._notify_user_membership_change(
+                room_id=room_id, user_id=user.to_string(), change="joined"
+            )
+        else:
+            user_joined_room(self.distributor, user, room_id)
+
+    @defer.inlineCallbacks
+    def get_room_complexity(self, remote_room_hosts, room_id):
+        """
+        Fetch the complexity of a remote room over federation.
+
+        Args:
+            remote_room_hosts (list[str]): The remote servers to ask.
+            room_id (str): The room ID to ask about.
+
+        Returns:
+            Deferred[dict] or Deferred[None]: Dict contains the complexity
+            metric versions, while None means we could not fetch the complexity.
+        """
+
+        for host in remote_room_hosts:
+            res = yield self.federation_client.get_room_complexity(host, room_id)
+
+            # We got a result, return it.
+            if res:
+                defer.returnValue(res)
+
+        # We fell off the bottom, couldn't get the complexity from anyone. Oh
+        # well.
+        defer.returnValue(None)
